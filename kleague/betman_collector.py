@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 
 BETMAN_URL = "https://www.betman.co.kr/buyPsblGame/gameInfoInq.do"
@@ -48,7 +49,18 @@ def _cffi_session():
     return _session
 
 
-def fetch_round(gm_ts):
+def fetch_round(gm_ts, retries=2):
+    """베트맨이 가끔 연결을 끊으므로 몇 번 다시 시도한다."""
+    for attempt in range(retries + 1):
+        try:
+            return _fetch_round(gm_ts)
+        except Exception:
+            if attempt == retries:
+                raise
+            time.sleep(3)
+
+
+def _fetch_round(gm_ts):
     payload = {"gmId": PROTO_GM_ID, "gmTs": gm_ts, "gameYear": "",
                "_sbmInfo": {"_sbmInfo": {"debugMode": "false"}}}
     headers = {**HEADERS, "Referer": "https://www.betman.co.kr/main/mainPage/gamebuy/"
@@ -102,7 +114,9 @@ def save_state(state):
 def ingest(url, token, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
                                  headers={"Content-Type": "application/json",
-                                          "Authorization": f"Bearer {token}"})
+                                          "Authorization": f"Bearer {token}",
+                                          # Cloudflare 가 Python 기본 User-Agent 를 막는 경우가 있다
+                                          "User-Agent": "kleague-betman-collector/1.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode()
 
@@ -141,7 +155,10 @@ def main(argv=None):
                 print(f"  {kst} {r['leagueName']} {r['homeName']} vs {r['awayName']} "
                       f"[{r['betNm']} {r['winHandi']}] {r['winAllot']} {r['drawAllot']} {r['loseAllot']}")
         else:
-            print("  ", ingest(url, token, {"gmTs": gm_ts, "rows": picked}))
+            try:
+                print("  ", ingest(url, token, {"gmTs": gm_ts, "rows": picked}))
+            except Exception as e:
+                print(f"  전송 실패 ({e})")
     if not args.gmts and newest:
         save_state({"last_gmts": newest})
 
