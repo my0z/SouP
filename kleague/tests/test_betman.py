@@ -35,10 +35,40 @@ class BetmanTest(unittest.TestCase):
     def test_candidate_rounds(self):
         with mock.patch.object(bc, "datetime") as dt:
             dt.datetime.now.return_value.year = 2026
-            dt.timezone = bc.datetime.timezone
-            self.assertEqual(bc.candidate_rounds(260113), [260112, 260113, 260114, 260115, 260116])
+            self.assertEqual(bc.candidate_rounds(260113), [260113, 260114])
+            self.assertEqual(bc.candidate_rounds(260113, check_prev=True), [260112, 260113, 260114])
             dt.datetime.now.return_value.year = 2027
-            self.assertEqual(bc.candidate_rounds(260150)[-3:], [270001, 270002, 270003])
+            self.assertEqual(bc.candidate_rounds(260150), [260150, 260151, 270001, 270002])
+
+    def test_pause_hours_grows_and_caps(self):
+        self.assertEqual([bc.pause_hours(n) for n in (1, 2, 3, 5, 9)], [2, 4, 8, 24, 24])
+
+    def _run_auto(self, fetch, state):
+        saved = {}
+        with mock.patch.object(bc, "fetch_round", side_effect=fetch), \
+             mock.patch.object(bc, "ingest", return_value="ok"), \
+             mock.patch.object(bc, "load_state", return_value=dict(state)), \
+             mock.patch.object(bc, "save_state", side_effect=saved.update), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch.dict(os.environ, {"INGEST_URL": "http://x", "INGEST_TOKEN": "t"}):
+            bc.main([])
+        return saved
+
+    def test_all_failures_pause_and_skip_next_run(self):
+        def boom(ts):
+            raise OSError("reset")
+        saved = self._run_auto(boom, {"last_gmts": 260113})
+        self.assertEqual(saved["fail_count"], 1)
+        self.assertGreater(saved["pause_until"], bc.time.time() + 3600)
+        fetch = mock.Mock()
+        self._run_auto(fetch, saved)
+        fetch.assert_not_called()
+
+    def test_success_resets_failures_and_advances_round(self):
+        saved = self._run_auto(lambda ts: self.data if ts == 260114 else {},
+                               {"last_gmts": 260113, "fail_count": 3, "prev_checked_at": bc.time.time()})
+        self.assertEqual(saved["fail_count"], 0)
+        self.assertEqual(saved["last_gmts"], 260114)
 
     def test_main_ingests_picked_rows(self):
         sent = []

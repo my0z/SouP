@@ -13,6 +13,7 @@ import argparse
 import datetime
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -88,14 +89,25 @@ def filter_rows(rows, league_pattern):
     return [r for r in rows if r.get("itemCode") == "SC" and pat.search(r.get("leagueName") or "")]
 
 
-def candidate_rounds(last):
-    """직전 회차(결과 갱신용)부터 다음 몇 회차와 해가 바뀐 경우의 1회차를 후보로 돌려준다."""
+PREV_CHECK_SEC = 3 * 3600   # 직전 회차(결과 반영용)는 3시간에 한 번만 본다
+MAX_JITTER_SEC = 300        # 실행 시각을 0~5분 무작위로 늦춘다
+PAUSE_BASE_HOURS = 2        # 연속 실패 시 2 4 8 ... 최대 24시간 쉰다
+
+
+def candidate_rounds(last, check_prev=False):
+    """현재 회차와 다음 회차. 필요할 때만 직전 회차와 새해 1회차를 더한다."""
     year, no = divmod(last, 10000)
-    cands = [year * 10000 + no + i for i in range(-1, 4) if no + i > 0]
+    cands = [last, last + 1]
+    if check_prev and no > 1:
+        cands.insert(0, last - 1)
     this_year = datetime.datetime.now(KST).year % 100
     if this_year > year:
-        cands += [this_year * 10000 + i for i in range(1, 4)]
+        cands += [this_year * 10000 + 1, this_year * 10000 + 2]
     return cands
+
+
+def pause_hours(fail_count):
+    return min(PAUSE_BASE_HOURS * 2 ** (fail_count - 1), 24)
 
 
 def load_state():
@@ -127,20 +139,36 @@ def main(argv=None):
     p.add_argument("--league", default=os.environ.get("LEAGUE_PATTERN", "K리그"),
                    help="leagueName 정규식 (기본값: K리그)")
     p.add_argument("--dry-run", action="store_true", help="Worker로 보내지 않고 출력만")
+    p.add_argument("--no-jitter", action="store_true", help="시작 전 무작위 대기 생략")
     args = p.parse_args(argv)
 
     state = load_state()
-    rounds = [args.gmts] if args.gmts else candidate_rounds(state.get("last_gmts", 260113))
+    now = time.time()
     url, token = os.environ.get("INGEST_URL"), os.environ.get("INGEST_TOKEN")
     if not args.dry_run and not (url and token):
         sys.exit("INGEST_URL 과 INGEST_TOKEN 환경변수를 설정하세요. 시험만 하려면 --dry-run")
 
-    newest = state.get("last_gmts", 0)
-    for gm_ts in rounds:
+    auto = not args.gmts and not args.dry_run
+    if auto and now < state.get("pause_until", 0):
+        left = (state["pause_until"] - now) / 3600
+        print(f"연속 실패로 쉬는 중 ({left:.1f}시간 남음)")
+        return
+    if auto and not args.no_jitter:
+        time.sleep(random.uniform(0, MAX_JITTER_SEC))
+
+    check_prev = now - state.get("prev_checked_at", 0) >= PREV_CHECK_SEC
+    rounds = [args.gmts] if args.gmts else candidate_rounds(state.get("last_gmts", 260113), check_prev)
+
+    newest, ok, failed = state.get("last_gmts", 0), 0, 0
+    for i, gm_ts in enumerate(rounds):
+        if i:
+            time.sleep(random.uniform(2, 6))  # 요청 사이 간격도 사람처럼
         try:
             rows = rows_of(fetch_round(gm_ts))
+            ok += 1
         except Exception as e:  # 네트워크 오류나 JSON 이 아닌 응답
             print(f"{gm_ts}: 조회 실패 ({e})")
+            failed += 1
             continue
         if not rows:
             continue
@@ -159,8 +187,21 @@ def main(argv=None):
                 print("  ", ingest(url, token, {"gmTs": gm_ts, "rows": picked}))
             except Exception as e:
                 print(f"  전송 실패 ({e})")
-    if not args.gmts and newest:
-        save_state({"last_gmts": newest})
+
+    if not auto:
+        return
+    state["last_gmts"] = newest or state.get("last_gmts", 260113)
+    if check_prev and ok:
+        state["prev_checked_at"] = now
+    if failed and not ok:
+        # 한 번도 성공하지 못하면 차단일 수 있으니 점점 길게 쉰다
+        state["fail_count"] = state.get("fail_count", 0) + 1
+        hours = pause_hours(state["fail_count"])
+        state["pause_until"] = now + hours * 3600
+        print(f"모든 요청 실패. {hours}시간 쉽니다")
+    else:
+        state["fail_count"], state["pause_until"] = 0, 0
+    save_state(state)
 
 
 if __name__ == "__main__":

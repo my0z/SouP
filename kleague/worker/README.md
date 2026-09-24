@@ -38,12 +38,12 @@ python3 betman_collector.py
 
 ### 주기 실행 (리눅스 cron 예시)
 ```cron
-*/15 * * * * cd /path/to/SouP/kleague && INGEST_URL=https://kl.usb.kr/ingest INGEST_TOKEN=토큰 python3 betman_collector.py >> betman.log 2>&1
+*/30 * * * * cd /path/to/SouP/kleague && INGEST_URL=https://kl.usb.kr/ingest INGEST_TOKEN=토큰 python3 betman_collector.py >> betman.log 2>&1
 ```
 로그는 UTF-8 이라 PowerShell 에서는 `Get-Content betman.log -Encoding utf8` 로 봐야 글자가 깨지지 않습니다.
 
-Windows는 `kleague/run_betman.bat` 에 토큰을 넣고 `install_task.bat` 을 한 번 실행하면 15분마다 돌아갑니다. 토큰을 넣은 bat 파일은 커밋하지 마세요.
-베트맨 부담을 줄이기 위해 15분 이상 간격을 권합니다.
+Windows는 `kleague/run_betman.bat` 에 토큰을 넣고 `install_task.bat` 을 한 번 실행하면 30분마다 돌아갑니다. 토큰을 넣은 bat 파일은 커밋하지 마세요.
+수집기는 시작 전 0~5분 무작위로 기다리고 한 번에 2~3회차만 조회합니다. 모든 요청이 실패하면 2시간부터 최대 24시간까지 스스로 쉽니다.
 
 ## 저장 방식
 - `proto_matches`: 경기의 게임 유형(승무패 핸디캡 언더오버 등) 하나당 한 행. 상태와 결과와 점수가 갱신됩니다
