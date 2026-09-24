@@ -1,3 +1,5 @@
 kleague_odds.db
 collect.log
+betman.log
+.betman_state.json
 __pycache__/

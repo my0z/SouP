@@ -1,38 +1,54 @@
-# K리그 배당 웹 (kl.usb.kr)
+# K리그 프로토 배당 웹 (kl.usb.kr)
 
-Cloudflare Worker 하나가 수집과 조회를 모두 맡습니다.
-- 3시간마다 Cron으로 API-Football에서 일정/결과와 배당(승무패, 언더/오버)을 받아 D1 `kleague-odds` 에 쌓습니다
-- `https://kl.usb.kr/` 에서 7일 안 경기의 북메이커별 승무패 배당과 첫 수집 대비 변동을 보여줍니다
-- `/api/upcoming` 은 같은 데이터를 JSON으로 줍니다
+베트맨 프로토 승부식의 K리그 배당을 모아 보여주는 페이지입니다.
 
-D1 데이터베이스(`b56dde0a-c13e-4119-b69b-ed9ec1054632`)와 테이블은 이미 만들어 두었습니다.
+```
+국내 PC (betman_collector.py) ──POST /ingest──▶ Cloudflare Worker ──▶ D1 kleague-odds
+                                                     │
+                                          https://kl.usb.kr 에서 조회
+```
 
-## 배포
+베트맨은 해외 IP를 막습니다. 그래서 수집은 국내 PC가 하고 Worker는 저장과 화면만 맡습니다.
+
+## 1. Worker 배포 (한 번만)
+D1 데이터베이스와 테이블은 이미 만들어 두었습니다.
 ```bash
 cd kleague/worker
 npm install
 npx wrangler login
-npx wrangler secret put API_FOOTBALL_KEY   # API-Football 키
-npx wrangler secret put COLLECT_TOKEN      # 수동 수집용 아무 문자열
+npx wrangler secret put INGEST_TOKEN   # 수집기와 같이 쓸 긴 임의 문자열
 npm run deploy
 ```
-배포하면 `kl.usb.kr` 커스텀 도메인이 자동 연결됩니다.
-DNS에 `kl` 레코드가 이미 있으면 배포가 실패하니 Cloudflare 대시보드에서 먼저 지워야 합니다.
+DNS에 `kl` 레코드가 이미 있으면 배포가 실패하니 대시보드에서 먼저 지워야 합니다.
 
-첫 데이터는 Cron을 기다리지 않고 바로 채울 수 있습니다.
-```
-https://kl.usb.kr/collect?token=COLLECT_TOKEN값
-```
-
-## 호출량
-한 번 실행에 리그당 약 3~5회 호출합니다. 3시간 간격이면 하루 약 60회로 무료 한도(100회) 안입니다.
-배당 마켓을 늘리려면 `wrangler.toml` 의 `BET_IDS` 를 바꾸되 호출량이 마켓 수만큼 늘어납니다.
-
-## 로컬 검증
+## 2. 국내 PC에서 수집기 실행
+Python 3.8 이상만 있으면 됩니다.
 ```bash
-python3 test/mock_api.py 8799 &
-printf 'API_BASE=http://127.0.0.1:8799\nAPI_FOOTBALL_KEY=test-key\nCOLLECT_TOKEN=local\n' > .dev.vars
-npx wrangler d1 execute kleague-odds --local --file=schema.sql
-npx wrangler dev --local
-curl "localhost:8787/collect?token=local" && open http://localhost:8787
+cd kleague
+python3 betman_collector.py --dry-run          # 전송 없이 동작 확인
+export INGEST_URL=https://kl.usb.kr/ingest
+export INGEST_TOKEN=위에서_정한_토큰
+python3 betman_collector.py
 ```
+- 최근 회차를 자동으로 찾아갑니다. 마지막 회차는 `.betman_state.json` 에 저장됩니다
+- 직전 회차도 같이 받아서 경기 결과가 반영됩니다
+- K리그가 없는 회차(A매치 기간 등)에는 보낼 것이 없어서 대상 0행으로 끝납니다
+- 다른 리그로 시험하려면 `--league "아시안게임"` 처럼 리그명 정규식을 주면 됩니다
+
+### 주기 실행 (리눅스 cron 예시)
+```cron
+*/15 * * * * cd /path/to/SouP/kleague && INGEST_URL=https://kl.usb.kr/ingest INGEST_TOKEN=토큰 python3 betman_collector.py >> betman.log 2>&1
+```
+Windows는 작업 스케줄러에 같은 명령을 등록하면 됩니다.
+베트맨 부담을 줄이기 위해 15분 이상 간격을 권합니다.
+
+## 저장 방식
+- `proto_matches`: 경기의 게임 유형(승무패 핸디캡 언더오버 등) 하나당 한 행. 상태와 결과와 점수가 갱신됩니다
+- `proto_odds`: 배당이 직전 값과 달라질 때만 한 줄씩 쌓입니다. 화면의 ▲▼ 는 첫 수집 대비 변동입니다
+
+## 응답 구조 메모
+`gameInfoInq.do` 는 `{"gmId":"G101","gmTs":260113}` 을 POST 하면 `compSchedules.keys` 와 `compSchedules.datas` 를 줍니다.
+- `winAllot drawAllot loseAllot`: 배당 (0 이면 아직 미발표)
+- `winHandi`: 핸디캡 또는 언더오버 기준값
+- `gameResult`: 0 = 왼쪽(승 또는 언더) 1 = 무 2 = 오른쪽(패 또는 오버) 4 = 적특
+- `protoStatus`: 4 = 결과 확정

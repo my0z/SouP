@@ -2,10 +2,6 @@ name = "kleague-odds"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
-# 3시간마다 수집 (UTC 기준)
-[triggers]
-crons = ["0 */3 * * *"]
-
 [[routes]]
 pattern = "kl.usb.kr"
 custom_domain = true
@@ -14,7 +10,3 @@ custom_domain = true
 binding = "DB"
 database_name = "kleague-odds"
 database_id = "b56dde0a-c13e-4119-b69b-ed9ec1054632"
-
-[vars]
-LEAGUES = "292,293"   # K리그1, K리그2
-BET_IDS = "1,5"       # 1=승무패 5=언더/오버

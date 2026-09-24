@@ -1,132 +1,103 @@
-// K리그 배당 수집 + 조회 페이지 (Cloudflare Worker + D1)
-//   scheduled: API-Football 에서 일정/결과와 배당을 받아 D1 에 누적
-//   GET /            : 다가오는 경기와 북메이커별 승무패 배당 (첫 수집 대비 변동 포함)
-//   GET /api/upcoming: 같은 데이터를 JSON 으로
-//   GET /collect?token=... : 수동 수집 (COLLECT_TOKEN 시크릿이 있을 때만)
+// K리그 프로토 배당 조회 페이지 (Cloudflare Worker + D1)
+//   베트맨은 해외 IP를 막으므로 국내 PC의 betman_collector.py 가 수집해서 /ingest 로 보낸다.
+//   POST /ingest       : 수집기가 보낸 compSchedules 행 저장 (INGEST_TOKEN 필요)
+//   GET  /             : 다가오는 경기의 게임 유형별 배당과 첫 수집 대비 변동, 최근 결과
+//   GET  /api/upcoming : 같은 데이터를 JSON 으로
 
-const DEFAULT_API = "https://v3.football.api-sports.io";
-const LEAGUE_NAMES = { 292: "K리그1", 293: "K리그2" };
 const DAY = 86400;
-const DONE = ["FT", "AET", "PEN"];
+const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
 
-const list = (s) => String(s).split(",").map((x) => parseInt(x, 10)).filter(Boolean);
 const nowIso = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
-const kstYear = () => new Date(Date.now() + 9 * 3600e3).getUTCFullYear();
-const ymd = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
+const num = (v) => (typeof v === "number" && v > 0 ? v : null);
 
-async function apiGet(env, path, params) {
-  const url = `${env.API_BASE || DEFAULT_API}${path}?${new URLSearchParams(params)}`;
-  const res = await fetch(url, { headers: { "x-apisports-key": env.API_FOOTBALL_KEY } });
-  if (!res.ok) throw new Error(`${path} HTTP ${res.status}`);
-  const body = await res.json();
-  const errors = body.errors;
-  if (errors && (Array.isArray(errors) ? errors.length : Object.keys(errors).length)) {
-    throw new Error(`${path} ${JSON.stringify(params)}: ${JSON.stringify(errors)}`);
-  }
-  return body;
-}
-
-async function apiGetAll(env, path, params) {
-  const items = [];
-  for (let page = 1; ; page++) {
-    const body = await apiGet(env, path, page > 1 ? { ...params, page } : params);
-    items.push(...(body.response || []));
-    if (page >= (body.paging?.total || 1)) return items;
-  }
-}
-
-async function runBatch(db, stmts) {
-  for (let i = 0; i < stmts.length; i += 500) await db.batch(stmts.slice(i, i + 500));
-}
-
-export function fixtureStmts(db, items) {
+export function ingestStmts(db, gmTs, rows) {
   const ts = nowIso();
-  const sql = db.prepare(
-    `INSERT INTO fixtures VALUES (?,?,?,?,?,?,?,?,?,?,?)
-     ON CONFLICT(fixture_id) DO UPDATE SET
-       round=excluded.round, kickoff_ts=excluded.kickoff_ts, status=excluded.status,
-       home_goals=excluded.home_goals, away_goals=excluded.away_goals, updated_at=excluded.updated_at`
+  const upsert = db.prepare(
+    `INSERT INTO proto_matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(gm_ts, match_seq) DO UPDATE SET
+       league=excluded.league, home=excluded.home, away=excluded.away, game_ts=excluded.game_ts,
+       bet_name=excluded.bet_name, handi=excluded.handi, win_txt=excluded.win_txt,
+       draw_txt=excluded.draw_txt, lose_txt=excluded.lose_txt, status=excluded.status,
+       result=excluded.result, score=excluded.score, updated_at=excluded.updated_at`
   );
-  return items.map((it) =>
-    sql.bind(
-      it.fixture.id, it.league.id, it.league.season, it.league.round ?? null,
-      it.fixture.timestamp, it.fixture.status.short,
-      it.teams.home.name, it.teams.away.name,
-      it.goals.home ?? null, it.goals.away ?? null, ts
-    )
+  // 직전 스냅샷과 같으면 넣지 않는다
+  const snap = db.prepare(
+    `INSERT INTO proto_odds (gm_ts, match_seq, win, draw, lose, handi, fetched_at)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+     WHERE NOT EXISTS (
+       SELECT 1 FROM (SELECT win, draw, lose, handi FROM proto_odds
+                      WHERE gm_ts = ?1 AND match_seq = ?2 ORDER BY id DESC LIMIT 1) l
+       WHERE l.win IS ?3 AND l.draw IS ?4 AND l.lose IS ?5 AND l.handi IS ?6)`
   );
-}
-
-export function oddsStmts(db, items) {
-  const ts = nowIso();
-  const sql = db.prepare("INSERT OR IGNORE INTO odds VALUES (?,?,?,?,?,?,?,?,?)");
   const out = [];
-  for (const it of items)
-    for (const bm of it.bookmakers || [])
-      for (const bet of bm.bets || [])
-        for (const v of bet.values || [])
-          out.push(sql.bind(it.fixture.id, bm.id, bm.name, bet.id, bet.name,
-                            String(v.value), parseFloat(v.odd), it.update, ts));
+  for (const r of rows) {
+    const handi = r.winHandi ?? null;
+    out.push(upsert.bind(
+      gmTs, r.matchSeq, r.leagueName ?? null, r.homeName ?? null, r.awayName ?? null,
+      Math.floor(r.gameDate / 1000), r.betId ?? null, r.betNm ?? null, handi,
+      r.winTxt ?? null, r.drawTxt ?? null, r.loseTxt ?? null, r.protoStatus ?? null,
+      r.gameResult ?? null, r.mchScore ?? null, ts
+    ));
+    const [w, d, l] = [num(r.winAllot), num(r.drawAllot), num(r.loseAllot)];
+    if (w || d || l) out.push(snap.bind(gmTs, r.matchSeq, w, d, l, handi, ts));
+  }
   return out;
 }
 
-export async function collect(env) {
-  if (!env.API_FOOTBALL_KEY) throw new Error("API_FOOTBALL_KEY 시크릿이 없습니다");
-  const season = kstYear();
-  const now = Math.floor(Date.now() / 1000);
-  const log = [];
-  for (const league of list(env.LEAGUES || "292,293")) {
-    // 최근 3일 결과 갱신 + 2주 뒤 경기까지
-    const fixtures = await apiGetAll(env, "/fixtures", {
-      league, season, from: ymd(now - 3 * DAY), to: ymd(now + 14 * DAY),
-    });
-    await runBatch(env.DB, fixtureStmts(env.DB, fixtures));
-    let odds = 0;
-    for (const bet of list(env.BET_IDS || "1,5")) {
-      const items = await apiGetAll(env, "/odds", { league, season, bet });
-      const stmts = oddsStmts(env.DB, items);
-      await runBatch(env.DB, stmts);
-      odds += stmts.length;
-    }
-    log.push(`${LEAGUE_NAMES[league] || league}: 경기 ${fixtures.length} 배당행 ${odds}`);
-  }
-  return log.join("\n");
+async function runBatch(db, stmts) {
+  for (let i = 0; i < stmts.length; i += 200) await db.batch(stmts.slice(i, i + 200));
 }
 
-export async function upcoming(db, days = 7) {
-  const now = Math.floor(Date.now() / 1000);
-  const { results: fixtures } = await db
-    .prepare(`SELECT * FROM fixtures WHERE status='NS' AND kickoff_ts BETWEEN ? AND ? ORDER BY kickoff_ts`)
-    .bind(now - 3 * 3600, now + days * DAY).all();
-  const { results: recent } = await db
-    .prepare(`SELECT * FROM fixtures WHERE status IN (${DONE.map(() => "?").join(",")})
-              AND kickoff_ts >= ? ORDER BY kickoff_ts DESC`)
-    .bind(...DONE, now - 3 * DAY).all();
-  const ids = fixtures.map((f) => f.fixture_id);
-  const odds = {};
-  if (ids.length) {
-    const { results } = await db
-      .prepare(
-        `WITH r AS (
-           SELECT fixture_id, bookmaker_id, bookmaker, value, odd, api_update,
-             ROW_NUMBER() OVER (PARTITION BY fixture_id, bookmaker_id, value ORDER BY api_update DESC) AS rn_last,
-             ROW_NUMBER() OVER (PARTITION BY fixture_id, bookmaker_id, value ORDER BY api_update ASC) AS rn_first
-           FROM odds WHERE bet_id = 1 AND fixture_id IN (${ids.map(() => "?").join(",")}))
-         SELECT fixture_id, bookmaker, value,
-           MAX(CASE WHEN rn_last = 1 THEN odd END) AS last,
-           MAX(CASE WHEN rn_first = 1 THEN odd END) AS first,
-           MAX(api_update) AS updated
-         FROM r GROUP BY fixture_id, bookmaker_id, value`
-      )
-      .bind(...ids).all();
-    for (const r of results) {
-      const book = ((odds[r.fixture_id] ||= {})[r.bookmaker] ||= { updated: r.updated });
-      book[r.value] = { last: r.last, first: r.first };
+const isMain = (b) => /승무패$/.test(b.bet_name || "") && !/전반/.test(b.bet_name || "");
+
+// 경기(홈/원정/시각) 단위로 게임 유형들을 묶는다
+function groupGames(rows) {
+  const games = new Map();
+  for (const r of rows) {
+    const key = `${r.game_ts}|${r.home}|${r.away}`;
+    if (!games.has(key)) {
+      games.set(key, { game_ts: r.game_ts, league: r.league, home: r.home, away: r.away, score: null, bets: [] });
     }
+    const g = games.get(key);
+    // 점수는 전체 승무패 행 기준 (핸디캡과 언더오버 행은 보정된 값이 들어온다)
+    if (isMain(r) && r.score && r.status === "4") g.score = r.score;
+    g.bets.push(r);
   }
+  return [...games.values()].sort((a, b) => a.game_ts - b.game_ts);
+}
+
+export async function loadGames(db, { from, to }) {
+  const { results } = await db
+    .prepare(
+      `WITH r AS (
+         SELECT gm_ts, match_seq, win, draw, lose,
+           ROW_NUMBER() OVER (PARTITION BY gm_ts, match_seq ORDER BY id DESC) AS rn_last,
+           ROW_NUMBER() OVER (PARTITION BY gm_ts, match_seq ORDER BY id ASC) AS rn_first
+         FROM proto_odds WHERE (gm_ts, match_seq) IN
+           (SELECT gm_ts, match_seq FROM proto_matches WHERE game_ts BETWEEN ?1 AND ?2)),
+       o AS (
+         SELECT gm_ts, match_seq,
+           MAX(CASE WHEN rn_last = 1 THEN win END) AS w, MAX(CASE WHEN rn_last = 1 THEN draw END) AS d,
+           MAX(CASE WHEN rn_last = 1 THEN lose END) AS l,
+           MAX(CASE WHEN rn_first = 1 THEN win END) AS w0, MAX(CASE WHEN rn_first = 1 THEN draw END) AS d0,
+           MAX(CASE WHEN rn_first = 1 THEN lose END) AS l0,
+           COUNT(*) AS changes
+         FROM r GROUP BY gm_ts, match_seq)
+       SELECT m.*, o.w, o.d, o.l, o.w0, o.d0, o.l0, o.changes
+       FROM proto_matches m LEFT JOIN o USING (gm_ts, match_seq)
+       WHERE m.game_ts BETWEEN ?1 AND ?2
+       ORDER BY m.game_ts, m.match_seq`
+    )
+    .bind(from, to).all();
+  return groupGames(results);
+}
+
+async function pageData(db) {
+  const now = Math.floor(Date.now() / 1000);
+  const games = await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY });
   return {
-    fixtures: fixtures.map((f) => ({ ...f, odds: odds[f.fixture_id] || {} })),
-    recent,
+    upcoming: games.filter((g) => g.game_ts >= now - 3 * 3600 && !g.score),
+    recent: games.filter((g) => g.score).reverse(),
   };
 }
 
@@ -139,95 +110,98 @@ const kst = (ts) =>
     hour: "2-digit", minute: "2-digit", hour12: false,
   }).format(new Date(ts * 1000));
 
-function oddCell(o) {
-  if (!o) return "<td>-</td>";
-  const diff = o.first && o.last !== o.first ? o.last - o.first : 0;
+function cell(label, v, v0, hit) {
+  if (!v) return `<td class="na">-</td>`;
+  const diff = v0 && v !== v0 ? v - v0 : 0;
   const move = diff
     ? `<small class="${diff < 0 ? "down" : "up"}">${diff < 0 ? "▼" : "▲"}${Math.abs(diff).toFixed(2)}</small>`
     : "";
-  return `<td>${o.last.toFixed(2)}${move}</td>`;
+  return `<td class="${hit ? "hit" : ""}"><span class="lbl">${esc(label)}</span>${v.toFixed(2)}${move}</td>`;
 }
 
-function fixtureCard(f) {
-  const books = Object.entries(f.odds).filter(([, o]) => o.Home && o.Draw && o.Away);
-  let body = `<p class="muted">아직 배당이 없습니다</p>`;
-  if (books.length) {
-    const avg = [0, 0, 0];
-    const rows = books.map(([name, o]) => {
-      const inv = [o.Home, o.Draw, o.Away].map((x) => 1 / x.last);
-      const sum = inv[0] + inv[1] + inv[2];
-      inv.forEach((p, i) => (avg[i] += p / sum / books.length));
-      return `<tr><th>${esc(name)}</th>${oddCell(o.Home)}${oddCell(o.Draw)}${oddCell(o.Away)}
-              <td class="muted">${((sum - 1) * 100).toFixed(1)}%</td></tr>`;
-    });
-    const bar = ["home", "draw", "away"]
-      .map((c, i) => `<span class="${c}" style="flex:${avg[i]}">${(avg[i] * 100).toFixed(0)}%</span>`)
-      .join("");
-    body = `<div class="bar">${bar}</div>
-      <div class="scroll"><table><thead><tr><th>북메이커</th><th>홈</th><th>무</th><th>원정</th><th>마진</th></tr></thead>
-      <tbody>${rows.join("")}</tbody></table></div>`;
-  }
-  return `<article>
-    <header><span class="tag">${esc(LEAGUE_NAMES[f.league_id] || f.league_id)}</span>
-      <time>${kst(f.kickoff_ts)}</time></header>
-    <h2>${esc(f.home_team)} <span class="muted">vs</span> ${esc(f.away_team)}</h2>
-    ${body}</article>`;
+function betRow(b) {
+  const name = String(b.bet_name || "").replace(/^축구\s*/, "");
+  const ou = /언더오버/.test(name);
+  const handi = b.handi ? `<span class="h">${ou ? "기준 " : b.handi > 0 ? "+" : ""}${b.handi}</span>` : "";
+  const hit = RESULT_IDX[b.result];
+  return `<tr><th>${esc(name)}${handi}</th>
+    ${cell(b.win_txt || "승", b.w, b.w0, hit === 0)}
+    ${cell(b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.d, b.d0, hit === 1)}
+    ${cell(b.lose_txt || "패", b.l, b.l0, hit === 2)}</tr>`;
 }
 
-function page({ fixtures, recent }) {
-  const results = recent
-    .map((f) => `<li><time>${kst(f.kickoff_ts)}</time> ${esc(f.home_team)}
-      <b>${f.home_goals} : ${f.away_goals}</b> ${esc(f.away_team)}</li>`)
+function probBar(g) {
+  const main = g.bets.find((b) => isMain(b) && b.w && b.d && b.l);
+  if (!main) return "";
+  const inv = [main.w, main.d, main.l].map((x) => 1 / x);
+  const sum = inv[0] + inv[1] + inv[2];
+  const seg = ["home", "draw", "away"]
+    .map((c, i) => `<span class="${c}" style="flex:${inv[i]}">${((inv[i] / sum) * 100).toFixed(0)}%</span>`)
     .join("");
+  return `<div class="bar">${seg}</div><p class="muted small">마진 ${((sum - 1) * 100).toFixed(1)}% · 마진 제외 확률</p>`;
+}
+
+function gameCard(g) {
+  return `<article>
+    <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>
+      ${g.score ? `<b class="score">${esc(g.score)}</b>` : ""}</header>
+    <h2>${esc(g.home)} <span class="muted">vs</span> ${esc(g.away)}</h2>
+    ${g.score ? "" : probBar(g)}
+    <div class="scroll"><table><tbody>${g.bets.map(betRow).join("")}</tbody></table></div>
+  </article>`;
+}
+
+function page({ upcoming, recent }) {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>K리그 배당</title>
+<title>K리그 프로토 배당</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--fg:#14161a;--muted:#6b7280;--line:#e5e7eb;--home:#2563eb;--draw:#9ca3af;--away:#dc2626;--up:#dc2626;--down:#2563eb}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--muted:#9097a3;--line:#2a2e36;--home:#3b82f6;--draw:#6b7280;--away:#ef4444;--up:#f87171;--down:#60a5fa}}
+:root{--bg:#f6f7f9;--card:#fff;--fg:#14161a;--muted:#6b7280;--line:#e5e7eb;--home:#2563eb;--draw:#9ca3af;--away:#dc2626;--up:#dc2626;--down:#2563eb;--hit:#dcfce7}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--muted:#9097a3;--line:#2a2e36;--home:#3b82f6;--draw:#6b7280;--away:#ef4444;--up:#f87171;--down:#60a5fa;--hit:#14532d}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif}
 main{max-width:760px;margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 4px}
-h2{font-size:17px;margin:6px 0 12px}.muted{color:var(--muted)}
+h2{font-size:17px;margin:6px 0 10px}h3{font-size:16px;margin:28px 0 4px}.muted{color:var(--muted)}.small{font-size:12px;margin:-6px 0 8px}
 article,section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:12px 0}
 article header{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--muted)}
 .tag{background:var(--line);color:var(--fg);border-radius:6px;padding:1px 8px;font-weight:600}
+.score{margin-left:auto;color:var(--fg);font-size:15px}
 .bar{display:flex;height:22px;border-radius:6px;overflow:hidden;margin-bottom:10px;font-size:12px;color:#fff;font-weight:600}
 .bar span{display:flex;align-items:center;justify-content:center;min-width:32px}
 .home{background:var(--home)}.draw{background:var(--draw)}.away{background:var(--away)}
 .scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th,td{padding:6px 8px;border-top:1px solid var(--line);text-align:right;white-space:nowrap}
-th:first-child{text-align:left;font-weight:500}thead th{border-top:0;color:var(--muted);font-weight:500;font-size:13px}
+th{text-align:left;font-weight:500}td.hit{background:var(--hit);font-weight:700}td.na{color:var(--muted)}
+.lbl{color:var(--muted);font-size:12px;margin-right:4px}.h{margin-left:6px;color:var(--muted);font-size:12px}
 small{margin-left:4px;font-size:11px}.up{color:var(--up)}.down{color:var(--down)}
-ul{list-style:none;padding:0;margin:0}li{padding:6px 0;border-top:1px solid var(--line)}li:first-child{border-top:0}
-li time{color:var(--muted);font-size:13px;margin-right:8px}
-@media (max-width:480px){th,td{padding:6px 4px}small{display:block;margin:0}}
+@media (max-width:480px){th,td{padding:6px 4px}.lbl{display:block;margin:0}small{display:block;margin:0}}
 </style></head><body><main>
-<h1>K리그 배당</h1>
-<p class="muted">7일 안 경기 · 승무패 최신 배당 · ▲▼ 는 첫 수집 대비 변동 · 막대는 마진을 뺀 평균 확률</p>
-${fixtures.length ? fixtures.map(fixtureCard).join("") : `<section class="muted">7일 안에 예정된 경기가 없거나 아직 수집 전입니다</section>`}
-${results ? `<section><h2>최근 결과</h2><ul>${results}</ul></section>` : ""}
+<h1>K리그 프로토 배당</h1>
+<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동</p>
+${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 K리그 프로토 경기가 없거나 아직 수집 전입니다</section>`}
+${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 </main></body></html>`;
 }
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
-    if (url.pathname === "/api/upcoming") {
-      return Response.json(await upcoming(env.DB, parseInt(url.searchParams.get("days")) || 7));
-    }
-    if (url.pathname === "/collect") {
-      if (!env.COLLECT_TOKEN || url.searchParams.get("token") !== env.COLLECT_TOKEN) {
+    if (url.pathname === "/ingest" && req.method === "POST") {
+      const auth = req.headers.get("authorization") || "";
+      if (!env.INGEST_TOKEN || auth !== `Bearer ${env.INGEST_TOKEN}`) {
         return new Response("forbidden", { status: 403 });
       }
-      return new Response(await collect(env), { headers: { "content-type": "text/plain; charset=utf-8" } });
+      const body = await req.json();
+      if (!Number.isInteger(body.gmTs) || !Array.isArray(body.rows)) {
+        return new Response("bad request", { status: 400 });
+      }
+      const stmts = ingestStmts(env.DB, body.gmTs, body.rows);
+      await runBatch(env.DB, stmts);
+      return Response.json({ ok: true, rows: body.rows.length });
     }
+    if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB));
     if (url.pathname !== "/") return new Response("not found", { status: 404 });
-    return new Response(page(await upcoming(env.DB)), {
-      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300" },
+    return new Response(page(await pageData(env.DB)), {
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=120" },
     });
-  },
-
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(collect(env).then(console.log));
   },
 };
