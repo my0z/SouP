@@ -31,12 +31,35 @@ HEADERS = {
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 
+try:
+    # 베트맨은 브라우저가 아닌 TLS 접속을 끊는다. curl_cffi 가 있으면 Chrome 처럼 접속한다.
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
+
+_session = None
+
+
+def _cffi_session():
+    global _session
+    if _session is None:
+        _session = cffi_requests.Session(impersonate="chrome")
+        _session.get("https://www.betman.co.kr/main/mainPage/gamebuy/buyableGameList.do", timeout=30)
+    return _session
+
+
 def fetch_round(gm_ts):
-    body = json.dumps({"gmId": PROTO_GM_ID, "gmTs": gm_ts, "gameYear": "",
-                       "_sbmInfo": {"_sbmInfo": {"debugMode": "false"}}}).encode()
+    payload = {"gmId": PROTO_GM_ID, "gmTs": gm_ts, "gameYear": "",
+               "_sbmInfo": {"_sbmInfo": {"debugMode": "false"}}}
     headers = {**HEADERS, "Referer": "https://www.betman.co.kr/main/mainPage/gamebuy/"
                                      f"gameSlip.do?gmId={PROTO_GM_ID}&gmTs={gm_ts}"}
-    req = urllib.request.Request(BETMAN_URL, data=body, headers=headers, method="POST")
+    if cffi_requests:
+        # User-Agent 는 impersonate 값과 맞아야 하므로 직접 넣지 않는다
+        headers.pop("User-Agent")
+        resp = _cffi_session().post(BETMAN_URL, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    req = urllib.request.Request(BETMAN_URL, data=json.dumps(payload).encode(), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.load(resp)
 
@@ -102,7 +125,7 @@ def main(argv=None):
     for gm_ts in rounds:
         try:
             rows = rows_of(fetch_round(gm_ts))
-        except (OSError, ValueError) as e:
+        except Exception as e:  # 네트워크 오류나 JSON 이 아닌 응답
             print(f"{gm_ts}: 조회 실패 ({e})")
             continue
         if not rows:

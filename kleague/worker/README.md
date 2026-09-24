@@ -22,8 +22,9 @@ npm run deploy
 DNS에 `kl` 레코드가 이미 있으면 배포가 실패하니 대시보드에서 먼저 지워야 합니다.
 
 ## 2. 국내 PC에서 수집기 실행
-Python 3.8 이상만 있으면 됩니다.
+Python 3.8 이상이 필요합니다. 베트맨은 브라우저가 아닌 접속을 끊으므로 Chrome 처럼 접속하는 `curl_cffi` 를 설치합니다.
 ```bash
+python -m pip install curl_cffi
 cd kleague
 python3 betman_collector.py --dry-run          # 전송 없이 동작 확인
 export INGEST_URL=https://kl.usb.kr/ingest
