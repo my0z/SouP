@@ -139,7 +139,7 @@ def main(argv=None):
             for r in picked:
                 kst = datetime.datetime.fromtimestamp(r["gameDate"] / 1000, KST).strftime("%m-%d %H:%M")
                 print(f"  {kst} {r['leagueName']} {r['homeName']} vs {r['awayName']} "
-                      f"[{r['betTypNm']} {r['winHandi']}] {r['winAllot']} {r['drawAllot']} {r['loseAllot']}")
+                      f"[{r['betNm']} {r['winHandi']}] {r['winAllot']} {r['drawAllot']} {r['loseAllot']}")
         else:
             print("  ", ingest(url, token, {"gmTs": gm_ts, "rows": picked}))
     if not args.gmts and newest:

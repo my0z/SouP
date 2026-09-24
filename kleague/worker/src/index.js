@@ -8,7 +8,8 @@ const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
 
 const nowIso = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
-const num = (v) => (typeof v === "number" && v > 0 ? v : null);
+// 0 은 미발표 1.0 은 미발매 자리값이라 버린다
+const num = (v) => (typeof v === "number" && v > 1 ? v : null);
 
 export function ingestStmts(db, gmTs, rows) {
   const ts = nowIso();
