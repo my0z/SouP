@@ -1,5 +1,7 @@
 # K리그 배당 수집기
 
+> 웹 버전(kl.usb.kr)은 [`worker/`](worker/README.md) 에 있습니다. PC 없이 Cloudflare에서 자동 수집됩니다.
+
 API-Football 무료 플랜으로 K리그1과 K리그2의 일정과 결과와 배당을 받아 SQLite(`kleague_odds.db`)에 쌓습니다.
 API-Football은 배당을 경기 후 7일만 보관하므로 직접 주기적으로 받아 두어야 배당 이력이 남습니다.
 
