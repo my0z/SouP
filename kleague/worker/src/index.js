@@ -12,6 +12,25 @@ const nowIso = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
 // 0 은 미발표 1.0 은 미발매 자리값이라 버린다
 const num = (v) => (typeof v === "number" && v > 1 ? v : null);
 
+// 과거 회차(2021~)는 betNm 과 winTxt 가 비어 있고 handi 코드로만 게임 종류를 알 수 있다
+const LEGACY_BETS = {
+  0: ["축구 승무패", "승", "무", "패"],
+  2: ["축구 핸디캡", "승", "무", "패"],
+  23: ["축구 소수핸디캡", "승", "-", "패"],
+  9: ["축구 언더오버", "언더", "-", "오버"],
+  27: ["축구 SUM", "홀", "-", "짝"],
+};
+
+export function normalizeRow(r) {
+  const legacy = r.betNm ? null : LEGACY_BETS[r.handi];
+  if (!legacy) return r;
+  const [betNm, winTxt, drawTxt, loseTxt] = legacy;
+  return { ...r, betNm, winTxt: r.winTxt ?? winTxt, drawTxt: r.drawTxt ?? drawTxt, loseTxt: r.loseTxt ?? loseTxt };
+}
+
+// 결과 확정: 요즘 회차는 protoStatus 4 과거 회차는 20
+export const isFinished = (b) => ["4", "20"].includes(String(b.status)) && !!b.score;
+
 export function ingestStmts(db, gmTs, rows) {
   const ts = nowIso();
   const upsert = db.prepare(
@@ -32,7 +51,8 @@ export function ingestStmts(db, gmTs, rows) {
        WHERE l.win IS ?3 AND l.draw IS ?4 AND l.lose IS ?5 AND l.handi IS ?6)`
   );
   const out = [];
-  for (const r of rows) {
+  for (const raw of rows) {
+    const r = normalizeRow(raw);
     const handi = r.winHandi ?? null;
     out.push(upsert.bind(
       gmTs, r.matchSeq, r.leagueName ?? null, r.homeName ?? null, r.awayName ?? null,
@@ -62,7 +82,7 @@ function groupGames(rows) {
     }
     const g = games.get(key);
     // 점수는 전체 승무패 행 기준 (핸디캡과 언더오버 행은 보정된 값이 들어온다)
-    if (isMain(r) && r.score && r.status === "4") g.score = r.score;
+    if (isMain(r) && isFinished(r)) g.score = r.score;
     g.bets.push(r);
   }
   return [...games.values()].sort((a, b) => a.game_ts - b.game_ts);
