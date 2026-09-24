@@ -32,6 +32,15 @@ class BetmanTest(unittest.TestCase):
         self.assertEqual({r["matchSeq"] for r in picked}, {4491, 4492, 4494})
         self.assertEqual(len(bc.filter_rows(rows, "MLB")), 0)  # 야구 제외
 
+    def test_default_league_matches_long_and_short_names(self):
+        def row(name, short=None):
+            return {"itemCode": "SC", "leagueName": name, "leagueShortName": short}
+        rows = [row("K리그1"), row("K리그2"), row("K1리그"), row(None, "K2리그"),
+                row("WK리그"), row("J1리그"), row("한국FA컵")]
+        picked = bc.filter_rows(rows, bc.DEFAULT_LEAGUE)
+        self.assertEqual([r["leagueName"] or r["leagueShortName"] for r in picked],
+                         ["K리그1", "K리그2", "K1리그", "K2리그"])
+
     def test_candidate_rounds(self):
         with mock.patch.object(bc, "datetime") as dt:
             dt.datetime.now.return_value.year = 2026

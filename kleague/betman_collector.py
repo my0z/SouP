@@ -86,9 +86,14 @@ def rows_of(data):
     return [dict(zip(keys, row)) for row in datas]
 
 
+# 최근 회차는 "K리그1" 이고 과거 회차는 "K1리그" 처럼 짧게 온다. 여자 WK리그는 뺀다.
+DEFAULT_LEAGUE = r"(?<!W)K\s?[12]?\s?리그"
+
+
 def filter_rows(rows, league_pattern):
     pat = re.compile(league_pattern)
-    return [r for r in rows if r.get("itemCode") == "SC" and pat.search(r.get("leagueName") or "")]
+    return [r for r in rows if r.get("itemCode") == "SC"
+            and (pat.search(r.get("leagueName") or "") or pat.search(r.get("leagueShortName") or ""))]
 
 
 PREV_CHECK_SEC = 3 * 3600   # 직전 회차(결과 반영용)는 3시간에 한 번만 본다
@@ -221,8 +226,8 @@ def run_backfill(args, url, token):
 def main(argv=None):
     p = argparse.ArgumentParser(description="베트맨 프로토 승부식 K리그 배당 수집기")
     p.add_argument("--gmts", type=int, help="특정 회차만 수집 (예: 260113)")
-    p.add_argument("--league", default=os.environ.get("LEAGUE_PATTERN", "K리그"),
-                   help="leagueName 정규식 (기본값: K리그)")
+    p.add_argument("--league", default=os.environ.get("LEAGUE_PATTERN", DEFAULT_LEAGUE),
+                   help="리그 이름 정규식 (기본값: K리그1 K리그2 K1리그 K2리그)")
     p.add_argument("--dry-run", action="store_true", help="Worker로 보내지 않고 출력만")
     p.add_argument("--no-jitter", action="store_true", help="시작 전 무작위 대기 생략")
     p.add_argument("--backfill", type=int, metavar="YEAR",
