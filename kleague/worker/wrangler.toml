@@ -6,6 +6,11 @@ compatibility_date = "2026-09-01"
 pattern = "kl.usb.kr"
 custom_domain = true
 
+# usb.kr 에 걸린 *.usb.kr/* (htaccess Worker) 보다 우선하도록 더 구체적인 경로를 건다
+[[routes]]
+pattern = "kl.usb.kr/*"
+zone_name = "usb.kr"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "kleague-odds"
