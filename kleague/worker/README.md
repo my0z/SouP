@@ -39,7 +39,7 @@ python3 betman_collector.py
 ```cron
 */15 * * * * cd /path/to/SouP/kleague && INGEST_URL=https://kl.usb.kr/ingest INGEST_TOKEN=토큰 python3 betman_collector.py >> betman.log 2>&1
 ```
-Windows는 작업 스케줄러에 같은 명령을 등록하면 됩니다.
+Windows는 `kleague/run_betman.bat` 에 토큰을 넣고 `install_task.bat` 을 한 번 실행하면 15분마다 돌아갑니다. 토큰을 넣은 bat 파일은 커밋하지 마세요.
 베트맨 부담을 줄이기 위해 15분 이상 간격을 권합니다.
 
 ## 저장 방식
