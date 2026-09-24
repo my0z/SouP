@@ -80,6 +80,51 @@ class BetmanTest(unittest.TestCase):
         self.assertEqual(sent[0]["gmTs"], 260113)
         self.assertEqual(len(sent[0]["rows"]), 3)
 
+class BackfillTest(unittest.TestCase):
+    def setUp(self):
+        with open(FIXTURE) as f:
+            self.data = json.load(f)
+
+    def run_step(self, fetch, state, max_rounds=20):
+        sent = []
+        with mock.patch.object(bc, "fetch_round", side_effect=fetch):
+            result = bc.backfill_step(state, "아시안게임", lambda ts, rows: sent.append(ts),
+                                      max_rounds, sleep=lambda s: None)
+        return result, sent
+
+    def test_moves_to_next_year_after_empty_rounds_and_stops(self):
+        # 2024년은 1~2회차만 있고 2025년은 1회차만 있다
+        have = {240001, 240002, 250001}
+        state = {"year": 24, "no": 1, "empty": 0, "stop_at": 250002}
+        result, sent = self.run_step(lambda ts: self.data if ts in have else {}, state)
+        self.assertEqual(result, "done")
+        self.assertEqual(sent, [240001, 240002, 250001])
+
+    def test_limits_rounds_per_run_and_resumes(self):
+        state = {"year": 24, "no": 1, "empty": 0, "stop_at": 250001}
+        result, sent = self.run_step(lambda ts: self.data, state, max_rounds=3)
+        self.assertEqual(result, "more")
+        self.assertEqual(sent, [240001, 240002, 240003])
+        self.assertEqual(state["no"], 4)
+
+    def test_pauses_after_consecutive_failures_without_advancing(self):
+        def boom(ts):
+            raise OSError("reset")
+        state = {"year": 24, "no": 5, "empty": 0, "stop_at": 250001}
+        result, sent = self.run_step(boom, state)
+        self.assertEqual(result, "paused")
+        self.assertEqual(state["no"], 5)
+
+    def test_round_that_keeps_erroring_is_treated_as_missing(self):
+        def fetch(ts):
+            if ts == 240002:
+                raise ValueError("not json")
+            return self.data if ts == 240001 else {}
+        state = {"year": 24, "no": 1, "empty": 0, "stop_at": 250001}
+        result, sent = self.run_step(fetch, state)
+        self.assertEqual(result, "done")
+        self.assertEqual(sent, [240001])
+
 
 if __name__ == "__main__":
     unittest.main()

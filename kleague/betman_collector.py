@@ -8,6 +8,7 @@
     python3 betman_collector.py              # 최근 회차 자동 탐색 후 전송
     python3 betman_collector.py --dry-run    # 전송 없이 결과만 출력
     python3 betman_collector.py --gmts 260113 --league "아시안게임"   # 특정 회차와 리그로 시험
+    python3 betman_collector.py --backfill 2022                       # 2022년부터 과거 회차 50개씩 이어받기
 """
 import argparse
 import datetime
@@ -22,6 +23,7 @@ import urllib.request
 BETMAN_URL = "https://www.betman.co.kr/buyPsblGame/gameInfoInq.do"
 PROTO_GM_ID = "G101"  # 프로토 승부식
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".betman_state.json")
+BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".betman_backfill.json")
 HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Content-Type": "application/json; charset=UTF-8",
@@ -110,16 +112,16 @@ def pause_hours(fail_count):
     return min(PAUSE_BASE_HOURS * 2 ** (fail_count - 1), 24)
 
 
-def load_state():
+def load_state(path=STATE_FILE):
     try:
-        with open(STATE_FILE) as f:
+        with open(path) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
+def save_state(state, path=STATE_FILE):
+    with open(path, "w") as f:
         json.dump(state, f)
 
 
@@ -133,6 +135,89 @@ def ingest(url, token, payload):
         return resp.read().decode()
 
 
+EMPTY_ROUNDS_END_YEAR = 3   # 빈 회차가 3번 이어지면 그 해는 끝난 것으로 본다
+
+
+def backfill_step(state, league, send, max_rounds, sleep=time.sleep):
+    """과거 회차를 커서부터 max_rounds 개까지 받아 send(gm_ts, rows)로 넘긴다.
+
+    state: {"year": 22, "no": 1, "empty": 0, "stop_at": 260113} 를 제자리에서 갱신한다.
+    반환값: "done" (끝까지 받음) / "paused" (연속 실패) / "more" (다음 실행에서 계속)
+    """
+    fails, had_success = 0, False
+    for i in range(max_rounds):
+        gm_ts = state["year"] * 10000 + state["no"]
+        if gm_ts >= state["stop_at"]:
+            return "done"
+        if i:
+            sleep(random.uniform(8, 20))
+        try:
+            rows = rows_of(fetch_round(gm_ts))
+        except Exception as e:
+            print(f"{gm_ts}: 조회 실패 ({e})")
+            fails += 1
+            if fails < 3:
+                continue
+            if not had_success:
+                return "paused"  # 접속 자체가 안 된다. 차단일 수 있으니 쉰다
+            rows = []  # 다른 회차는 되는데 이 회차만 계속 오류면 없는 회차로 본다
+        else:
+            had_success = True
+        fails = 0
+        if not rows:
+            state["empty"] += 1
+            if state["empty"] >= EMPTY_ROUNDS_END_YEAR:
+                print(f"20{state['year']}년 끝 ({state['no'] - state['empty']}회차까지)")
+                state.update(year=state["year"] + 1, no=1, empty=0)
+            else:
+                state["no"] += 1
+            continue
+        state["empty"] = 0
+        picked = filter_rows(rows, league)
+        print(f"{gm_ts}: 전체 {len(rows)}행 중 대상 {len(picked)}행")
+        if picked:
+            send(gm_ts, picked)
+        state["no"] += 1
+    return "more"
+
+
+def run_backfill(args, url, token):
+    state = load_state(BACKFILL_FILE)
+    start_year = args.backfill % 100
+    if state.get("start_year") != start_year:
+        stop_at = load_state().get("last_gmts") or (datetime.datetime.now(KST).year % 100) * 10000 + 1
+        state = {"start_year": start_year, "year": start_year, "no": 1, "empty": 0, "stop_at": stop_at}
+    if time.time() < state.get("pause_until", 0):
+        print(f"연속 실패로 쉬는 중 ({(state['pause_until'] - time.time()) / 3600:.1f}시간 남음)")
+        return
+    if state.get("finished"):
+        print("과거 회차 수집은 이미 끝났습니다")
+        return
+
+    def send(gm_ts, rows):
+        if args.dry_run:
+            return
+        try:
+            print("  ", ingest(url, token, {"gmTs": gm_ts, "rows": rows}))
+        except Exception as e:
+            print(f"  전송 실패 ({e})")
+            raise
+
+    try:
+        result = backfill_step(state, args.league, send, args.rounds)
+    except Exception:
+        result = "send_failed"  # Worker 전송 실패. 커서는 그대로라 다음에 같은 회차부터 다시 한다
+    if result == "done":
+        state["finished"] = True
+        print("과거 회차 수집 완료")
+    elif result == "paused":
+        state["pause_until"] = time.time() + 6 * 3600
+        print("연속 실패. 6시간 뒤에 이어서 합니다")
+    else:
+        print(f"다음 실행은 {state['year'] * 10000 + state['no']} 회차부터")
+    save_state(state, BACKFILL_FILE)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="베트맨 프로토 승부식 K리그 배당 수집기")
     p.add_argument("--gmts", type=int, help="특정 회차만 수집 (예: 260113)")
@@ -140,6 +225,9 @@ def main(argv=None):
                    help="leagueName 정규식 (기본값: K리그)")
     p.add_argument("--dry-run", action="store_true", help="Worker로 보내지 않고 출력만")
     p.add_argument("--no-jitter", action="store_true", help="시작 전 무작위 대기 생략")
+    p.add_argument("--backfill", type=int, metavar="YEAR",
+                   help="YEAR년 1회차부터 과거 회차를 이어서 수집 (예: 2022). 실행할 때마다 --rounds 개씩")
+    p.add_argument("--rounds", type=int, default=50, help="--backfill 한 번에 볼 회차 수 (기본 50)")
     args = p.parse_args(argv)
 
     state = load_state()
@@ -147,6 +235,9 @@ def main(argv=None):
     url, token = os.environ.get("INGEST_URL"), os.environ.get("INGEST_TOKEN")
     if not args.dry_run and not (url and token):
         sys.exit("INGEST_URL 과 INGEST_TOKEN 환경변수를 설정하세요. 시험만 하려면 --dry-run")
+    if args.backfill:
+        run_backfill(args, url, token)
+        return
 
     auto = not args.gmts and not args.dry_run
     if auto and now < state.get("pause_until", 0):

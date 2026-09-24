@@ -3,6 +3,7 @@
 //   POST /ingest       : 수집기가 보낸 compSchedules 행 저장 (INGEST_TOKEN 필요)
 //   GET  /             : 다가오는 경기의 게임 유형별 배당과 첫 수집 대비 변동, 최근 결과
 //   GET  /api/upcoming : 같은 데이터를 JSON 으로
+//   GET  /export.csv   : 저장된 전체 경기와 배당 (분석용)
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -183,6 +184,28 @@ ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 </main></body></html>`;
 }
 
+// 분석용 전체 내보내기: 게임 유형별 첫 배당과 마지막 배당과 결과
+async function exportCsv(db) {
+  const games = await loadGames(db, { from: 0, to: 4102444800 });
+  const cols = ["gm_ts", "kickoff_kst", "league", "home", "away", "bet_name", "handi",
+    "win_txt", "draw_txt", "lose_txt", "w0", "d0", "l0", "w", "d", "l", "changes", "status", "result", "score"];
+  const q = (v) => (v == null ? "" : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+  const lines = [cols.join(",")];
+  for (const g of games) {
+    for (const b of g.bets) {
+      const kickoff = new Date((b.game_ts + 9 * 3600) * 1000).toISOString().slice(0, 16).replace("T", " ");
+      lines.push(cols.map((c) => q(c === "kickoff_kst" ? kickoff : b[c])).join(","));
+    }
+  }
+  // 엑셀에서 한글이 깨지지 않게 BOM 을 붙인다
+  return new Response("\ufeff" + lines.join("\n"), {
+    headers: {
+      "content-type": "text/csv; charset=utf-8",
+      "content-disposition": 'attachment; filename="kleague_proto.csv"',
+    },
+  });
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
@@ -200,6 +223,7 @@ export default {
       return Response.json({ ok: true, rows: body.rows.length });
     }
     if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB));
+    if (url.pathname === "/export.csv") return exportCsv(env.DB);
     if (url.pathname !== "/") return new Response("not found", { status: 404 });
     return new Response(page(await pageData(env.DB)), {
       headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=120" },

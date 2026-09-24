@@ -3,3 +3,5 @@ collect.log
 betman.log
 .betman_state.json
 __pycache__/
+backfill.log
+.betman_backfill.json
