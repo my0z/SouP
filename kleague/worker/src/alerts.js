@@ -67,7 +67,7 @@ async function accessToken(env) {
 export async function sendMemo(token, text, url = SITE) {
   const template = {
     object_type: "text",
-    text: text.slice(0, 200),  // 카카오 텍스트 템플릿 최대 200자
+    text: text.slice(0, 200),  // 카카오 텍스트 템플릿 최대 200자 (splitMessage 로 미리 나눈다)
     link: { web_url: url, mobile_web_url: url },
     button_title: "배당 보기",
   };
@@ -182,11 +182,23 @@ export function buildAlerts(games, sent, now = Math.floor(Date.now() / 1000)) {
 
 // 카카오 앱을 연결했으면 바로 보내고 아니면 큐에 쌓는다.
 // 큐는 Claude 루틴이 /alerts/pending 으로 읽어 PlayMCP 카카오톡 나에게 보내기로 보낸 뒤 /alerts/ack 로 지운다.
-// 카카오톡 나에게 보내기(PlayMCP)는 글만 보내므로 끝에 링크를 붙인다. 200자를 넘으면 뒤쪽 줄부터 뺀다
-export function withLink(text, url, max = 200) {
-  const lines = text.split("\n");
-  while (lines.length > 1 && lines.join("\n").length + url.length + 1 > max) lines.pop();
-  return `${lines.join("\n").slice(0, max - url.length - 1)}\n${url}`;
+// 카카오톡 나에게 보내기(PlayMCP)는 글만 보내므로 끝에 링크를 붙인다.
+// 한 메시지는 200자까지라 넘치면 줄 단위로 나눠 여러 메시지로 보낸다 (뒤 메시지에는 (2/3) 같은 표시)
+export function splitMessage(text, url, max = 200) {
+  const lines = [...text.split("\n"), url].flatMap((l) => {
+    const out = [];
+    for (let k = 0; k < l.length; k += max - 20) out.push(l.slice(k, k + max - 20));
+    return out.length ? out : [""];
+  });
+  const parts = [];
+  let cur = [];
+  for (const l of lines) {
+    if (cur.length && [...cur, l].join("\n").length > max - 20) { parts.push(cur); cur = []; }
+    cur.push(l);
+  }
+  parts.push(cur);
+  if (parts.length === 1) return [parts[0].join("\n")];
+  return parts.map((p, n) => (n ? `${PREFIX} (${n + 1}/${parts.length})\n` : "") + p.join("\n"));
 }
 
 export async function runAlerts(env) {
@@ -201,8 +213,8 @@ export async function runAlerts(env) {
     "INSERT INTO alert_log (key, value, sent_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, sent_at = excluded.sent_at");
   const enqueue = env.DB.prepare("INSERT INTO alert_queue (text, url, created_at) VALUES (?, ?, ?)");
   for (const a of todo) {
-    if (token) await sendMemo(token, a.text, a.url);
-    const stmts = token ? [] : [enqueue.bind(withLink(a.text, a.url), a.url, now)];
+    if (token) for (const part of splitMessage(a.text, a.url)) await sendMemo(token, part, a.url);
+    const stmts = token ? [] : splitMessage(a.text, a.url).map((t) => enqueue.bind(t, a.url, now));
     if (a.log !== false) stmts.push(put.bind(a.key, JSON.stringify(a.value), now));
     // 변동 비교 기준은 마지막으로 알린 배당
     if (a.odds) stmts.push(put.bind(`odds:${a.odds.id}`, JSON.stringify(a.odds.odds), now));
