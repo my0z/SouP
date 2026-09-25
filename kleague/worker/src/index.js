@@ -213,15 +213,30 @@ function probBar(g) {
   return `<div class="bar">${seg}</div><p class="muted small">마진 ${((sum - 1) * 100).toFixed(1)}% · 마진 제외 확률</p>`;
 }
 
+// 경기별 링크: 베트맨 회차 화면(마감 전은 구매 화면)과 네이버 경기 정보
+const BETMAN = "https://www.betman.co.kr/main/mainPage/gamebuy";
+export function gameLinks(g) {
+  const gmTs = g.bets[0]?.gm_ts;
+  const slip = g.score ? "closedGameSlip.do" : "gameSlip.do";
+  return {
+    id: `g${gmTs}-${g.bets[0]?.match_seq}`,
+    betman: `${BETMAN}/${slip}?gmId=G101&gmTs=${gmTs}`,
+    info: `https://search.naver.com/search.naver?query=${encodeURIComponent(`${g.home} ${g.away}`)}`,
+  };
+}
+
 function gameCard(g) {
   const changed = g.score ? [] : g.bets.map(betChange).filter((c) => c && c.kind === "changed");
   const flag = changed.length
     ? `<span class="badge changed">배당 변경 ${changed.length}건 · ${ago(Math.min(...changed.map((c) => c.sec)))}</span>`
     : "";
-  return `<article class="${changed.length ? "has-change" : ""}">
+  const link = gameLinks(g);
+  return `<article id="${esc(link.id)}" class="${changed.length ? "has-change" : ""}">
     <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>${flag}
       ${g.score ? `<b class="score">${esc(g.score)}</b>` : ""}</header>
-    <h2>${esc(g.home)} <span class="muted">vs</span> ${esc(g.away)}</h2>
+    <h2><a href="${esc(link.betman)}" target="_blank" rel="noopener">${esc(g.home)} <span class="muted">vs</span> ${esc(g.away)}</a></h2>
+    <nav class="links"><a href="${esc(link.betman)}" target="_blank" rel="noopener">${g.score ? "베트맨 결과" : "베트맨 구매"} ↗</a>
+      <a href="${esc(link.info)}" target="_blank" rel="noopener">경기 정보 ↗</a></nav>
     ${g.score ? "" : probBar(g)}
     <div class="scroll"><table><tbody>${g.bets.map(betRow).join("")}</tbody></table></div>
   </article>`;
@@ -238,7 +253,7 @@ function changeList(upcoming) {
       [b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", pick(b, b.d, b.d1)],
       [b.lose_txt || "패", pick(b, b.l, b.l1)],
     ].filter(([, t]) => t).map(([l, t]) => `${esc(l)} ${t}`).join(" · ");
-    return `<li><span class="muted">${ago(sec)}</span> ${esc(g.home)} vs ${esc(g.away)} <span class="muted">${esc(name)}</span> ${parts}</li>`;
+    return `<li><span class="muted">${ago(sec)}</span> <a href="#${esc(gameLinks(g).id)}">${esc(g.home)} vs ${esc(g.away)}</a> <span class="muted">${esc(name)}</span> ${parts}</li>`;
   }).join("");
   return `<section class="changes"><h2>최근 24시간 배당 변경</h2><ul>${rows}</ul></section>`;
 }
@@ -265,6 +280,9 @@ th,td{padding:6px 8px;border-top:1px solid var(--line);text-align:right;white-sp
 th{text-align:left;font-weight:500}td.hit{background:var(--hit);font-weight:700}td.na{color:var(--muted)}
 .lbl{color:var(--muted);font-size:12px;margin-right:4px}
 .badge{display:inline-block;margin-left:6px;padding:0 6px;border-radius:6px;font-size:11px;font-weight:700;vertical-align:1px}
+h2 a{color:inherit;text-decoration:none}h2 a:hover{text-decoration:underline}
+.links{display:flex;gap:12px;margin:-4px 0 10px;font-size:13px}.links a,.changes a{color:var(--home);text-decoration:none}
+.links a:hover,.changes a:hover{text-decoration:underline}article{scroll-margin-top:12px}
 .no{display:inline-block;min-width:34px;margin-right:6px;font-size:12px;font-weight:700;color:var(--muted);font-variant-numeric:tabular-nums}
 .badge.single{background:var(--hit);color:var(--fg)}
 .badge.changed{background:var(--chg);color:var(--chg-fg)}.badge.fresh{background:var(--line);color:var(--fg)}
