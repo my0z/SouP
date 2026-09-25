@@ -403,7 +403,7 @@ function cell(label, v, v0, v1, hit, recent, pick) {
   const flip = recent && v1 && v1 !== v;
   const prev = flip ? `<s class="prev">${v1.toFixed(2)}</s>` : "";
   const cls = [hit ? "hit" : "", flip ? "flip" : "", pick ? "pick" : ""].join(" ").trim();
-  const tag = pick ? `<em class="ptag">추천 +${(pick.ev * 100).toFixed(0)}%</em>` : "";
+  const tag = pick ? `<em class="ptag">▶ 여기 베팅</em>` : "";
   return `<td class="${cls}">${tag}<span class="lbl">${esc(label)}</span>${prev}${v.toFixed(2)}${move}</td>`;
 }
 
@@ -413,28 +413,52 @@ const pickOf = (b, side) => (b.picks || []).find((p) => p.side === side);
 const sideName = (b, side) =>
   [b.win_txt || "승", b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.lose_txt || "패"][side];
 
-// 추천 목록과 과거 검증 결과
+// 추천 목록과 과거 검증 결과. "어디에 무엇을 얼마" 가 바로 보이게 표 대신 베팅표처럼 보여 준다
+const circled = (n) => "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"[n] || `${n + 1}.`;
 function picksSection(picks, bt) {
   const roi = bt && bt.n ? bt.ret / bt.n - 1 : null;
   const verdict = roi == null
-    ? `아직 과거 검증할 데이터가 부족합니다 (시즌별로 앞 시즌 기록만 보고 다음 시즌을 맞혀 봅니다).`
-    : `과거 검증: 같은 방법으로 ${bt.n}번 추천했다면 적중 ${pc(bt.hit / bt.n)} · 수익률 <b class="${roi >= 0 ? "up" : "down"}">${roi >= 0 ? "+" : ""}${pc(roi)}</b> · 10만원씩 ${won((bt.ret - bt.n) * STAKE)}`;
-  const warn = roi == null
-    ? `<p class="warn">⚠️ 과거 검증은 시즌이 2개 이상 쌓여야 합니다. 그 전까지는 참고만 하세요.</p>`
-    : roi < 0
-      ? `<p class="warn">⚠️ 과거 검증에서 아직 손해입니다. 데이터가 쌓여 검증 수익률이 + 가 되기 전까지는 참고만 하세요.</p>`
-      : "";
-  const rows = picks.slice(0, 15).map(({ g, b, p }) => {
-    const single = String(b.sgl) === "1" ? `<span class="badge single">단폴</span>` : "";
-    const hd = b.handi ? ` ${/언더오버/.test(b.bet_name) ? "" : b.handi > 0 ? "+" : ""}${b.handi}` : "";
-    return `<li><a href="#${esc(gameLinks(g).id)}">${esc(g.home)} vs ${esc(g.away)}</a> <span class="muted">${kst(g.game_ts)}</span><br>
-      <span class="no">${esc(b.match_seq)}</span>${esc(stripSport(b.bet_name))}${esc(hd)} <b>${esc(sideName(b, p.side))} ${p.odd.toFixed(2)}</b>${single}
-      <span class="muted small2">기대수익 <b class="up">+${(p.ev * 100).toFixed(1)}%</b> · 비슷한 과거 ${p.n}번 적중 ${pc(p.pastHit)}</span></li>`;
+    ? `과거 검증: 아직 데이터 부족 (앞 시즌 기록으로 다음 시즌을 맞혀 보는데 시즌이 2개 이상 쌓여야 합니다)`
+    : `과거 검증: 같은 방법으로 ${bt.n}번 샀다면 적중 ${pc(bt.hit / bt.n)} · 수익률 <b class="${roi >= 0 ? "up" : "down"}">${roi >= 0 ? "+" : ""}${pc(roi)}</b> · 10만원씩 ${won((bt.ret - bt.n) * STAKE)}`;
+  const trusted = roi != null && roi > 0;
+  const warn = trusted ? ""
+    : `<p class="warn">⚠️ 과거 검증 수익률이 아직 + 가 아닙니다. 사더라도 아주 적은 금액으로만 시험하세요.</p>`;
+  const list = picks.slice(0, 10);
+  if (!list.length) {
+    return `<section class="picks"><h2>🎯 베팅할 곳</h2>
+      <div class="none"><b>지금은 베팅할 경기가 없습니다</b><br>조건(기대수익 ${MIN_EV * 100}% 이상 · 비슷한 과거 ${MIN_N}번 이상)에 맞는 선택이 없으니 사지 마세요.</div>
+      <p class="muted small">${verdict}</p></section>`;
+  }
+  const tickets = list.map(({ g, b, p }, n) => {
+    const single = String(b.sgl) === "1";
+    const hd = b.handi ? ` ${/언더오버/.test(b.bet_name) ? "기준 " : b.handi > 0 ? "+" : ""}${b.handi}` : "";
+    const pick = sideName(b, p.side);
+    const back = Math.round(p.odd * STAKE);
+    return `<li class="ticket">
+      <div class="t-head"><span class="t-no">${circled(n)}</span><a href="#${esc(gameLinks(g).id)}">${esc(g.home)} vs ${esc(g.away)}</a>
+        <span class="muted">${kst(g.game_ts)} · ${esc(g.league)}</span></div>
+      <div class="t-body">
+        <div>경기 번호 <b class="big">${esc(b.match_seq)}</b> · ${esc(stripSport(b.bet_name))}${esc(hd)}</div>
+        <div class="t-pick">▶ <b class="pickname">${esc(pick)}</b> 에 베팅 · 배당 <b>${p.odd.toFixed(2)}</b></div>
+        <div>10만원 → 맞으면 <b>${comma(back)}원</b> 받음 (<span class="up">${won(back - STAKE)}</span>) · 틀리면 <span class="down">-100,000원</span></div>
+        <div>${single ? `<span class="badge single">단폴</span> 이 경기 하나만 사도 됩니다` : `<span class="badge miss">단폴 불가</span> 다른 경기와 2개 이상 묶어야 삽니다`}</div>
+        <div class="muted small2">근거: 비슷한 과거 ${p.n}번 중 ${pc(p.pastHit)} 적중 · 배당이 말한 확률 ${pc(p.p)} · 기대수익 ${p.ev >= 0 ? "+" : ""}${(p.ev * 100).toFixed(1)}%</div>
+      </div></li>`;
   }).join("");
-  return `<section class="picks"><h2>추천 베팅</h2>
-    <p class="muted small">비슷한 배당이 과거에 실제로 더 자주 맞은 선택만 고릅니다 (기대수익 ${MIN_EV * 100}% 이상 · 과거 ${MIN_N}번 이상)</p>
-    <p class="small">${verdict}</p>${warn}
-    ${rows ? `<ul>${rows}</ul>` : `<p class="muted">지금 조건에 맞는 추천이 없습니다</p>`}</section>`;
+  // 단폴이 안 되는 추천은 서로 다른 경기끼리 두 개를 묶는 방법을 알려 준다 (같은 경기의 다른 게임은 묶을 수 없다)
+  const multi = list.map((x, n) => ({ ...x, n })).filter(({ b }) => String(b.sgl) !== "1");
+  let combo = "";
+  if (multi.length) {
+    const a = multi[0];
+    const partner = list.map((x, n) => ({ ...x, n })).find((x) => x.n !== a.n && gameLinks(x.g).id !== gameLinks(a.g).id);
+    combo = partner
+      ? `<p class="combo">단폴 불가 추천은 <b>${circled(a.n)} + ${circled(partner.n)}</b> 처럼 다른 경기와 2개를 묶어 한 장으로 삽니다. 두 개 다 맞아야 하고 배당은 곱해져 <b>${(a.p.odd * partner.p.odd).toFixed(2)}배</b>입니다.</p>`
+      : `<p class="combo">단폴 불가 추천만 있고 묶을 다른 추천이 없습니다. 이번에는 사지 않는 것이 좋습니다.</p>`;
+  }
+  return `<section class="picks"><h2>🎯 베팅할 곳 ${list.length}개</h2>
+    <p class="small">베트맨 <b>게임구매 → 프로토 승부식</b> 에서 <b>경기 번호</b>를 찾아 <b>▶ 표시한 쪽</b>을 고릅니다. 판매점 용지는 경기 번호와 그 칸을 칠합니다. 경기 카드에서는 <span class="legend-pick">보라색 칸</span>이 베팅할 곳이고 다른 색은 정보입니다.</p>
+    ${warn}<ol class="tickets">${tickets}</ol>${combo}
+    <p class="muted small">${verdict}</p></section>`;
 }
 
 function betRow(b) {
@@ -659,7 +683,12 @@ h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:12px;whi
 .curve .pt{fill:var(--pick);stroke:var(--card);stroke-width:2;vector-effect:non-scaling-stroke}
 table.ledger td,table.ledger th{font-size:13px;vertical-align:top}table.ledger td.l{text-align:left;white-space:normal}table.ledger .badge{margin:0}
 td.pick{box-shadow:0 0 0 2px var(--pick) inset;background:var(--pick-bg)}.ptag{display:block;font-style:normal;font-size:10px;font-weight:700;color:var(--pick)}
-.picks{border-color:var(--pick)}.picks ul{list-style:none;padding:0;margin:0}.picks li{padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+.picks{border:2px solid var(--pick)}.tickets{list-style:none;padding:0;margin:8px 0}
+.ticket{border:1px dashed var(--pick);border-radius:10px;padding:10px 12px;margin:8px 0;font-size:14px;background:var(--pick-bg)}
+.t-head{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-weight:600}.t-no{color:var(--pick);font-size:18px}
+.t-body>div{margin-top:4px}.big{font-size:18px}.t-pick{font-size:16px}.pickname{background:var(--pick);color:#fff;padding:1px 10px;border-radius:6px}
+.none{border:1px solid var(--line);border-radius:10px;padding:14px;text-align:center;font-size:15px;line-height:1.7}
+.combo{font-size:13px;background:var(--line);padding:8px 10px;border-radius:8px}.legend-pick{box-shadow:0 0 0 2px var(--pick) inset;background:var(--pick-bg);padding:0 6px;border-radius:4px}
 .picks a{color:var(--home);text-decoration:none}.small2{display:block;font-size:12px}.warn{font-size:13px;background:var(--chg);color:var(--chg-fg);padding:6px 10px;border-radius:8px}
 .tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.tabs a{padding:4px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--fg);text-decoration:none;font-size:14px}
 .tabs a.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}.tabs small{margin-left:2px;color:inherit;opacity:.7;display:inline}
