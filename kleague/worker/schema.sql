@@ -56,3 +56,17 @@ CREATE TABLE IF NOT EXISTS alert_queue (
     created_at   INTEGER NOT NULL,
     delivered_at INTEGER
 );
+
+-- 추천 베팅 기록: 수집할 때마다 지금 추천을 남기고 경기가 끝나면 결과와 맞춰 본다
+CREATE TABLE IF NOT EXISTS pick_log (
+    gm_ts        INTEGER NOT NULL,
+    match_seq    INTEGER NOT NULL,
+    side         INTEGER NOT NULL,   -- 0 왼쪽(승/언더) 1 무 2 오른쪽(패/오버)
+    game_ts      INTEGER NOT NULL,
+    odd          REAL NOT NULL,      -- 경기 전 마지막으로 추천할 때 배당
+    ev           REAL NOT NULL,      -- 그때 기대수익
+    active       INTEGER NOT NULL,   -- 경기 전 마지막 확인에서도 추천이었으면 1 (결과 기록에 넣는다)
+    first_at     INTEGER NOT NULL,
+    last_at      INTEGER NOT NULL,
+    PRIMARY KEY (gm_ts, match_seq, side)
+);

@@ -200,6 +200,7 @@ async function pageData(db, { sport = "", ctx, domesticOnly = true } = {}) {
     upcoming: games.filter((g) => g.game_ts >= now - 3 * 3600 && !g.score),
     recent: games.filter((g) => g.score).reverse().slice(0, domesticOnly ? 40 : 200),
     accuracy: accuracyFromAgg(stats.accuracy, sport),
+    ledger: domesticOnly ? await pickLedger(db) : undefined,
   };
 }
 
@@ -263,6 +264,65 @@ export function accuracyFromAgg(agg, sport = "") {
   return { total, buckets: buckets.filter((b) => b.n), draw, dog,
            seasons: Object.entries(seasons).sort().map(([season, acc]) => ({ season, ...acc })),
            leagues: Object.entries(leagues).sort((a, b) => b[1].n - a[1].n).map(([league, acc]) => ({ league, ...acc })) };
+}
+
+// ---------- 추천 베팅 기록 ----------
+// 수집기가 /notify 를 부를 때(30분마다) 앞으로 3일 안 국내 경기의 추천을 pick_log 에 남긴다.
+// 경기 전 마지막 확인에서도 추천이었던 것만(active=1) 결과 기록에 넣는다. 배당은 그때 마지막 배당.
+async function recordPicks(db, ctx) {
+  const now = Math.floor(Date.now() / 1000);
+  const games = (await loadGames(db, { from: now, to: now + 3 * DAY })).filter(isDomestic);
+  const model = new Model((await getStats(db, ctx)).picks.model);
+  const want = new Map();
+  for (const g of games) {
+    for (const b of g.bets) {
+      for (const p of model.picks(b)) want.set(`${b.gm_ts}|${b.match_seq}|${p.side}`, { b, p });
+    }
+  }
+  const { results } = await db.prepare("SELECT gm_ts, match_seq, side, odd, active FROM pick_log WHERE game_ts > ?").bind(now).all();
+  const have = new Map(results.map((r) => [`${r.gm_ts}|${r.match_seq}|${r.side}`, r]));
+  const stmts = [];
+  for (const [key, { b, p }] of want) {
+    const old = have.get(key);
+    if (old && old.active === 1 && old.odd === p.odd) continue;  // 그대로면 쓰지 않는다
+    stmts.push(db.prepare(
+      `INSERT INTO pick_log (gm_ts, match_seq, side, game_ts, odd, ev, active, first_at, last_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+       ON CONFLICT(gm_ts, match_seq, side) DO UPDATE SET odd = excluded.odd, ev = excluded.ev, active = 1,
+         game_ts = excluded.game_ts, last_at = excluded.last_at`
+    ).bind(b.gm_ts, b.match_seq, p.side, b.game_ts, p.odd, p.ev, now, now));
+  }
+  for (const [key, r] of have) {
+    if (!want.has(key) && r.active === 1) {
+      stmts.push(db.prepare("UPDATE pick_log SET active = 0, last_at = ? WHERE gm_ts = ? AND match_seq = ? AND side = ?")
+        .bind(now, r.gm_ts, r.match_seq, r.side));
+    }
+  }
+  if (stmts.length) await db.batch(stmts);
+  return stmts.length;
+}
+
+// 기록된 추천과 결과. 결과: won true/false, 적특(승패 게임의 무 결과)과 결과 전은 null
+async function pickLedger(db) {
+  const { results } = await db.prepare(
+    `SELECT p.gm_ts, p.match_seq, p.side, p.game_ts, p.odd, p.ev, m.league, m.home, m.away, m.bet_name, m.handi,
+       m.win_txt, m.draw_txt, m.lose_txt, m.status, m.result, m.score, m.sgl
+     FROM pick_log p JOIN proto_matches m USING (gm_ts, match_seq)
+     WHERE p.active = 1 ORDER BY p.game_ts DESC, p.match_seq LIMIT 300`
+  ).all();
+  return results.map((r) => {
+    const done = isFinished(r) && ["0", "1", "2"].includes(String(r.result));
+    const voided = done && String(r.result) === "1" && !r.draw_txt?.replace("-", "");
+    return { ...r, won: done && !voided ? Number(r.result) === r.side : null, voided };
+  });
+}
+
+export function ledgerSummary(rows) {
+  const settled = rows.filter((r) => r.won !== null).sort((a, b) => a.game_ts - b.game_ts);
+  let profit = 0;
+  const curve = settled.map((r) => ({ ts: r.game_ts, profit: (profit += (r.won ? r.odd - 1 : -1) * STAKE) }));
+  const hit = settled.filter((r) => r.won).length;
+  return { n: settled.length, hit, profit, roi: settled.length ? profit / (settled.length * STAKE) : null,
+           pending: rows.filter((r) => r.won === null && !r.voided).length, curve };
 }
 
 // ---------- 과거 통계 (적중률과 추천 근거) ----------
@@ -510,7 +570,58 @@ function tabs(sport, counts) {
   return `<nav class="tabs">${link("", "전체")}${SPORTS.map((s) => link(s, `${s} <small>${counts[s] || 0}</small>`)).join("")}</nav>`;
 }
 
-function page({ sport, counts, upcoming, recent, accuracy, picks, backtest }) {
+// 누적 손익 선 (한 줄이라 범례 없이 제목이 이름). 점마다 마우스를 올리면 그때 손익이 보인다
+function profitChart(curve) {
+  if (curve.length < 2) return "";
+  const W = 600, H = 160, P = 8;
+  const ys = curve.map((c) => c.profit).concat(0);
+  const lo = Math.min(...ys), hi = Math.max(...ys), span = hi - lo || 1;
+  const x = (i) => P + (i * (W - 2 * P)) / (curve.length - 1);
+  const y = (v) => P + ((hi - v) * (H - 2 * P)) / span;
+  const pts = curve.map((c, i) => `${x(i).toFixed(1)},${y(c.profit).toFixed(1)}`).join(" ");
+  const dots = curve.map((c, i) =>
+    `<circle cx="${x(i).toFixed(1)}" cy="${y(c.profit).toFixed(1)}" r="6" class="pt"><title>${kst(c.ts)} · 누적 ${won(c.profit)}</title></circle>`).join("");
+  return `<figure class="curve"><figcaption class="muted small">누적 손익 (10만원씩)</figcaption>
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="누적 손익 선 그래프">
+      <line x1="0" x2="${W}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}" class="zero"/>
+      <polyline points="${pts}" class="line"/>${dots}</svg></figure>`;
+}
+
+// 페이지 맨 아래: 추천 베팅이 실제로 어땠는지
+function ledgerSection(rows) {
+  if (!rows) return "";
+  const s = ledgerSummary(rows);
+  const tile = (label, value, cls = "") => `<div class="tile"><span class="muted">${label}</span><b class="${cls}">${value}</b></div>`;
+  const tiles = `<div class="tiles">
+    ${tile("베팅", `${s.n}번`)}
+    ${tile("적중", s.n ? `${s.hit}번 · ${pc(s.hit / s.n)}` : "-")}
+    ${tile("손익 (10만원씩)", s.n ? won(s.profit) : "-", s.profit > 0 ? "up" : s.profit < 0 ? "down" : "")}
+    ${tile("수익률", s.roi == null ? "-" : `${s.roi >= 0 ? "+" : ""}${pc(s.roi)}`, s.roi > 0 ? "up" : s.roi < 0 ? "down" : "")}
+    ${tile("결과 대기", `${s.pending}번`)}</div>`;
+  const line = (r) => {
+    const b = { win_txt: r.win_txt, draw_txt: r.draw_txt, lose_txt: r.lose_txt };
+    const hd = r.handi ? ` ${/언더오버/.test(r.bet_name) ? "" : r.handi > 0 ? "+" : ""}${r.handi}` : "";
+    const res = r.voided ? `<span class="muted">적특</span>`
+      : r.won === null ? `<span class="muted">대기</span>`
+      : r.won ? `<span class="badge hit">적중 ${esc(r.score || "")}</span>` : `<span class="badge miss">실패 ${esc(r.score || "")}</span>`;
+    const pl = r.won === null ? "" : won(r.won ? (r.odd - 1) * STAKE : -STAKE);
+    const when = new Date((r.game_ts + 9 * 3600) * 1000).toISOString().slice(5, 16).replace("-", ".").replace("T", " ");
+    return `<tr><td class="l">${esc(r.home)} vs ${esc(r.away)}<br><span class="muted">${when} · ${esc(r.league)} · ${esc(stripSport(r.bet_name))}${esc(hd)}</span></td>
+      <td><b>${esc(sideName(b, r.side))}</b><br>${r.odd.toFixed(2)}</td>
+      <td>${res}<br><span class="${r.won ? "up" : r.won === false ? "down" : ""}">${pl}</span></td></tr>`;
+  };
+  const table = rows.length
+    ? `<div class="scroll"><table class="ledger"><thead><tr><th>경기</th><th>선택</th><th>결과 · 손익</th></tr></thead>
+        <tbody>${rows.slice(0, 40).map(line).join("")}</tbody></table></div>`
+    : `<p class="muted">아직 기록된 추천이 없습니다. 추천이 나오면 경기 전 마지막 배당으로 자동 기록됩니다.</p>`;
+  return `<h3 id="ledger">추천 베팅 결과 기록</h3>
+  <section class="ledger-box">
+    <p class="muted small">위 추천 베팅을 경기마다 10만원씩 샀다고 치고 기록합니다 · 경기 전 마지막 확인까지 추천이었던 것만 · 배당은 그때 마지막 배당</p>
+    ${tiles}${profitChart(s.curve)}${table}
+  </section>`;
+}
+
+function page({ sport, counts, upcoming, recent, accuracy, picks, backtest, ledger }) {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>국내 프로토 배당</title>
@@ -539,6 +650,14 @@ h2 a{color:inherit;text-decoration:none}h2 a:hover{text-decoration:underline}
 .badge.hit{background:var(--hit);color:var(--fg)}.badge.miss{background:#fee2e2;color:#991b1b}
 h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:12px;white-space:nowrap;padding:6px 4px}
 .badge.single{background:var(--hit);color:var(--fg)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:8px 0 12px}
+.tile{border:1px solid var(--line);border-radius:10px;padding:8px 10px;display:flex;flex-direction:column;gap:2px}
+.tile span{font-size:12px}.tile b{font-size:17px;font-variant-numeric:tabular-nums}
+.curve{margin:0 0 12px}.curve svg{width:100%;height:auto;display:block}
+.curve .line{fill:none;stroke:var(--pick);stroke-width:2;vector-effect:non-scaling-stroke}
+.curve .zero{stroke:var(--muted);stroke-dasharray:4 4;stroke-width:1;vector-effect:non-scaling-stroke}
+.curve .pt{fill:var(--pick);stroke:var(--card);stroke-width:2;vector-effect:non-scaling-stroke}
+table.ledger td,table.ledger th{font-size:13px;vertical-align:top}table.ledger td.l{text-align:left;white-space:normal}table.ledger .badge{margin:0}
 td.pick{box-shadow:0 0 0 2px var(--pick) inset;background:var(--pick-bg)}.ptag{display:block;font-style:normal;font-size:10px;font-weight:700;color:var(--pick)}
 .picks{border-color:var(--pick)}.picks ul{list-style:none;padding:0;margin:0}.picks li{padding:8px 0;border-top:1px solid var(--line);font-size:14px}
 .picks a{color:var(--home);text-decoration:none}.small2{display:block;font-size:12px}.warn{font-size:13px;background:var(--chg);color:var(--chg-fg);padding:6px 10px;border-radius:8px}
@@ -553,13 +672,14 @@ article header{flex-wrap:wrap}.tag{white-space:nowrap}
 @media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
 </style></head><body><main>
 <h1>국내 프로토 배당</h1>
-<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <a href="#accuracy">예상 적중률 보기</a></p>
+<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <a href="#accuracy">예상 적중률 보기</a> · <a href="#ledger">추천 결과 기록</a></p>
 ${tabs(sport, counts)}
 ${picksSection(picks, backtest)}
 ${changeList(upcoming)}
 ${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 ${esc(sport || "국내")} 프로토 경기가 없거나 아직 수집 전입니다</section>`}
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 ${accuracySection(accuracy, sport)}
+${ledgerSection(ledger)}
 </main></body></html>`;
 }
 
@@ -630,7 +750,8 @@ export default {
       const auth = req.headers.get("authorization") || "";
       if (!env.INGEST_TOKEN || auth !== `Bearer ${env.INGEST_TOKEN}`) return new Response("forbidden", { status: 403 });
       try {
-        return Response.json(await runAlerts(env));
+        const logged = await recordPicks(env.DB, ctx);
+        return Response.json({ ...(await runAlerts(env)), picks_logged: logged });
       } catch (e) {
         return Response.json({ ok: false, reason: String(e.message || e) }, { status: 502 });
       }
