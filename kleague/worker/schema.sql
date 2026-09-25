@@ -34,3 +34,16 @@ CREATE TABLE IF NOT EXISTS proto_odds (
     fetched_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_proto_odds_match ON proto_odds (gm_ts, match_seq, id);
+
+-- 카카오 토큰 같은 설정값
+CREATE TABLE IF NOT EXISTS kv (
+    key          TEXT PRIMARY KEY,
+    value        TEXT NOT NULL
+);
+
+-- 보낸 알림 기록 (같은 알림을 두 번 보내지 않도록)
+CREATE TABLE IF NOT EXISTS alert_log (
+    key          TEXT PRIMARY KEY,   -- new:회차-번호 / pre:... / result:... / odds:... (마지막으로 알린 배당)
+    value        TEXT NOT NULL,
+    sent_at      INTEGER NOT NULL
+);

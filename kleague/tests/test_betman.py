@@ -150,5 +150,14 @@ class BackfillTest(unittest.TestCase):
         self.assertEqual(sent, [240001])
 
 
+
+class NotifyTest(unittest.TestCase):
+    def test_notify_calls_notify_endpoint_and_swallows_errors(self):
+        with mock.patch.object(bc, "ingest", return_value='{"ok":true}') as ing:
+            bc.notify("https://kl.usb.kr/ingest", "t")
+        ing.assert_called_once_with("https://kl.usb.kr/notify", "t", {})
+        with mock.patch.object(bc, "ingest", side_effect=OSError("down")):
+            bc.notify("https://kl.usb.kr/ingest", "t")  # 예외가 밖으로 나오지 않는다
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,9 @@
 //   GET  /export.csv   : 저장된 경기와 배당 CSV (분석용. gm_from gm_to league 로 나눠 받기)
 //   GET  /api/rounds   : 회차별 리그별 경기 수
 //   GET  /api/accuracy : 국내 경기 배당 예상과 실제 결과 비교 (?sport=야구)
+//   POST /notify       : K리그 카카오톡 알림 (src/alerts.js)
+
+import { runAlerts, kakaoLogin, kakaoCallback } from "./alerts.js";
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -16,7 +19,7 @@ const num = (v) => (typeof v === "number" && v > 1 ? v : null);
 
 // 베트맨 itemCode 로 종목을 안다
 const SPORT_CODES = { SC: "축구", BS: "야구", BK: "농구", VL: "배구", VB: "배구" };
-export const SPORTS = ["축구", "야구", "농구", "배구"];
+const SPORTS = ["축구", "야구", "농구", "배구"];
 export const sportOf = (betName) => {
   const first = String(betName || "").split(/\s/)[0];
   return SPORTS.includes(first) ? first : "기타";
@@ -98,7 +101,7 @@ async function runBatch(db, stmts) {
 
 // 기본 게임: 축구는 승무패 야구 농구 배구는 승패
 const isMain = (b) => /(승무패|승패)$/.test(b.bet_name || "") && !/전반/.test(b.bet_name || "");
-const mainOf = (g) => g.bets.find((b) => isMain(b) && b.w && b.l);
+export const mainOf = (g) => g.bets.find((b) => isMain(b) && b.w && b.l);
 
 // 경기(홈/원정/시각) 단위로 게임 유형들을 묶는다
 function groupGames(rows) {
@@ -265,7 +268,7 @@ function recentChanges(games) {
 // ---------- HTML ----------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-const kst = (ts) =>
+export const kst = (ts) =>
   new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul", month: "2-digit", day: "2-digit", weekday: "short",
     hour: "2-digit", minute: "2-digit", hour12: false,
@@ -284,7 +287,7 @@ function cell(label, v, v0, v1, hit, recent) {
   return `<td class="${cls}"><span class="lbl">${esc(label)}</span>${prev}${v.toFixed(2)}${move}</td>`;
 }
 
-const stripSport = (name) => String(name || "").replace(/^(축구|야구|농구|배구)\s*/, "");
+export const stripSport = (name) => String(name || "").replace(/^(축구|야구|농구|배구)\s*/, "");
 
 function betRow(b) {
   const name = stripSport(b.bet_name);
@@ -335,7 +338,7 @@ const man = (x) => {
   const [int, dec] = (Math.abs(x) / 10000).toFixed(1).split(".");
   return `${x >= 0 ? "+" : "-"}${comma(int)}.${dec}만`;
 };
-const won = (x) => `${x >= 0 ? "+" : "-"}${comma(x)}원`;
+export const won = (x) => `${x >= 0 ? "+" : "-"}${comma(x)}원`;
 
 function verdict(g) {
   const main = mainOf(g);
@@ -516,6 +519,17 @@ export default {
       await runBatch(env.DB, stmts);
       return Response.json({ ok: true, rows: body.rows.length });
     }
+    if (url.pathname === "/notify" && req.method === "POST") {
+      const auth = req.headers.get("authorization") || "";
+      if (!env.INGEST_TOKEN || auth !== `Bearer ${env.INGEST_TOKEN}`) return new Response("forbidden", { status: 403 });
+      try {
+        return Response.json(await runAlerts(env));
+      } catch (e) {
+        return Response.json({ ok: false, reason: String(e.message || e) }, { status: 502 });
+      }
+    }
+    if (url.pathname === "/kakao/login") return kakaoLogin(env, url);
+    if (url.pathname === "/kakao/callback") return kakaoCallback(env, url);
     const sport = SPORTS.includes(url.searchParams.get("sport")) ? url.searchParams.get("sport") : "";
     if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB, sport, ctx));
     if (url.pathname === "/api/accuracy") return Response.json(await accuracyCached(env.DB, sport, ctx));

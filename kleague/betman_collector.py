@@ -148,6 +148,15 @@ def ingest(url, token, payload):
         return resp.read().decode()
 
 
+def notify(url, token):
+    """Worker 에 K리그 카카오톡 알림을 보내라고 한다. 실패해도 수집은 계속한다."""
+    notify_url = re.sub(r"/ingest/?$", "/notify", url)
+    try:
+        print("알림", ingest(notify_url, token, {}))
+    except Exception as e:
+        print(f"알림 실패 ({e})")
+
+
 EMPTY_ROUNDS_END_YEAR = 3   # 빈 회차가 3번 이어지면 그 해는 끝난 것으로 본다
 
 
@@ -294,6 +303,8 @@ def main(argv=None):
 
     if not auto:
         return
+    if ok:
+        notify(url, token)
     state["last_gmts"] = newest or state.get("last_gmts", 260113)
     if check_prev and ok:
         state["prev_checked_at"] = now
