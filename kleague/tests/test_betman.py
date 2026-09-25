@@ -25,12 +25,25 @@ class BetmanTest(unittest.TestCase):
         self.assertEqual(bc.rows_of({"compSchedules": None}), [])
         self.assertEqual(bc.rows_of(None), [])
 
-    def test_filter_only_soccer_matching_league(self):
+    def test_filter_matching_league(self):
         rows = bc.rows_of(self.data)
         self.assertEqual(len(bc.filter_rows(rows, "K리그")), 0)
         picked = bc.filter_rows(rows, "아시안게임")
         self.assertEqual({r["matchSeq"] for r in picked}, {4491, 4492, 4494})
-        self.assertEqual(len(bc.filter_rows(rows, "MLB")), 0)  # 야구 제외
+        self.assertEqual(len(bc.filter_rows(rows, "MLB")), 1)  # 종목 제한 없음
+        self.assertEqual(len(bc.filter_rows(rows, bc.DEFAULT_LEAGUE)), 0)  # 해외 친선과 MLB 는 빠진다
+
+    def test_default_league_takes_all_domestic(self):
+        def row(name, short, domastic=None, item="BS"):
+            return {"itemCode": item, "leagueName": name, "leagueShortName": short, "domastic": domastic}
+        rows = [row("KBO", "KBO", True), row("NPB", "NPB", False), row("MLB", "MLB", False),
+                row("남자프로농구", "KBL", None, "BK"), row("여자프로농구", "WKBL", None, "BK"),
+                row("아시안게임 여자농구", "AG여농", False, "BK"), row("V-리그 남자", "KOVO남", None, "VL"),
+                row("코리아컵", "코리아컵", True, "SC")]
+        picked = bc.filter_rows(rows, bc.DEFAULT_LEAGUE)
+        self.assertEqual([r["leagueShortName"] for r in picked], ["KBO", "KBL", "WKBL", "KOVO남", "코리아컵"])
+        # 리그를 직접 고르면 국내 표시만으로는 넣지 않는다
+        self.assertEqual([r["leagueShortName"] for r in bc.filter_rows(rows, "KBL")], ["KBL", "WKBL"])
 
     def test_default_league_matches_long_and_short_names(self):
         def row(name, short=None):
@@ -41,7 +54,7 @@ class BetmanTest(unittest.TestCase):
                 row("미국 메이저리그사커", "MLS")]
         picked = bc.filter_rows(rows, bc.DEFAULT_LEAGUE)
         self.assertEqual([r["leagueShortName"] or r["leagueName"] for r in picked],
-                         ["K리그1", "K리그2", "K1리그", "K2리그", "J1리그", "EFL챔", "EPL", "MLS"])
+                         ["K리그1", "K리그2", "K1리그", "K2리그", "WK리그", "J1리그", "EFL챔", "EPL", "MLS"])
 
     def test_candidate_rounds(self):
         with mock.patch.object(bc, "datetime") as dt:

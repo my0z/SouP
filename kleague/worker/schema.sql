@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS proto_matches (
     score        TEXT,
     updated_at   TEXT NOT NULL,
     sgl          TEXT,               -- 1 이면 단폴(1경기) 구매 가능
+    domestic     INTEGER,            -- 베트맨 국내 리그 표시 (1 국내 0 해외 NULL 모름)
     PRIMARY KEY (gm_ts, match_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_proto_matches_game ON proto_matches (game_ts);

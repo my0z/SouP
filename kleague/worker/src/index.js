@@ -1,11 +1,11 @@
-// K리그 프로토 배당 조회 페이지 (Cloudflare Worker + D1)
+// 국내 프로토 배당 조회 페이지 (Cloudflare Worker + D1). 축구 야구 농구 배구 국내 리그 전체
 //   베트맨은 해외 IP를 막으므로 국내 PC의 betman_collector.py 가 수집해서 /ingest 로 보낸다.
 //   POST /ingest       : 수집기가 보낸 compSchedules 행 저장 (INGEST_TOKEN 필요)
-//   GET  /             : 다가오는 경기의 게임 유형별 배당과 첫 수집 대비 변동, 최근 결과
+//   GET  /             : 다가오는 경기의 게임 유형별 배당과 첫 수집 대비 변동, 최근 결과 (?sport=야구 로 종목 선택)
 //   GET  /api/upcoming : 같은 데이터를 JSON 으로
 //   GET  /export.csv   : 저장된 경기와 배당 CSV (분석용. gm_from gm_to league 로 나눠 받기)
 //   GET  /api/rounds   : 회차별 리그별 경기 수
-//   GET  /api/accuracy : K리그 배당 예상과 실제 결과 비교
+//   GET  /api/accuracy : 국내 경기 배당 예상과 실제 결과 비교 (?sport=야구)
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -14,20 +14,31 @@ const nowIso = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
 // 0 은 미발표 1.0 은 미발매 자리값이라 버린다
 const num = (v) => (typeof v === "number" && v > 1 ? v : null);
 
+// 베트맨 itemCode 로 종목을 안다
+const SPORT_CODES = { SC: "축구", BS: "야구", BK: "농구", VL: "배구", VB: "배구" };
+export const SPORTS = ["축구", "야구", "농구", "배구"];
+export const sportOf = (betName) => {
+  const first = String(betName || "").split(/\s/)[0];
+  return SPORTS.includes(first) ? first : "기타";
+};
+
 // 과거 회차(2021~)는 betNm 과 winTxt 가 비어 있고 handi 코드로만 게임 종류를 알 수 있다
 const LEGACY_BETS = {
-  0: ["축구 승무패", "승", "무", "패"],
-  2: ["축구 핸디캡", "승", "무", "패"],
-  23: ["축구 소수핸디캡", "승", "-", "패"],
-  9: ["축구 언더오버", "언더", "-", "오버"],
-  27: ["축구 SUM", "홀", "-", "짝"],
+  0: ["승무패", "승", "무", "패"],
+  2: ["핸디캡", "승", "무", "패"],
+  23: ["소수핸디캡", "승", "-", "패"],
+  9: ["언더오버", "언더", "-", "오버"],
+  27: ["SUM", "홀", "-", "짝"],
 };
 
 export function normalizeRow(r) {
   const legacy = r.betNm ? null : LEGACY_BETS[r.handi];
   if (!legacy) return r;
-  const [betNm, winTxt, drawTxt, loseTxt] = legacy;
-  return { ...r, betNm, winTxt: r.winTxt ?? winTxt, drawTxt: r.drawTxt ?? drawTxt, loseTxt: r.loseTxt ?? loseTxt };
+  let [kind, winTxt, drawTxt, loseTxt] = legacy;
+  const sport = SPORT_CODES[r.itemCode] || "축구";
+  // 축구가 아닌 종목의 기본 게임은 무승부 배당이 없으면 승패다
+  if (kind === "승무패" && sport !== "축구" && !(r.drawAllot > 1)) [kind, drawTxt] = ["승패", "-"];
+  return { ...r, betNm: `${sport} ${kind}`, winTxt: r.winTxt ?? winTxt, drawTxt: r.drawTxt ?? drawTxt, loseTxt: r.loseTxt ?? loseTxt };
 }
 
 // 결과 확정: 요즘 회차는 protoStatus 4 과거 회차는 20
@@ -37,14 +48,23 @@ export function ingestStmts(db, gmTs, rows) {
   const ts = nowIso();
   const upsert = db.prepare(
     `INSERT INTO proto_matches (gm_ts, match_seq, league, home, away, game_ts, bet_id, bet_name, handi,
-       win_txt, draw_txt, lose_txt, status, result, score, updated_at, sgl)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       win_txt, draw_txt, lose_txt, status, result, score, updated_at, sgl, domestic)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(gm_ts, match_seq) DO UPDATE SET
        league=excluded.league, home=excluded.home, away=excluded.away, game_ts=excluded.game_ts,
        bet_name=excluded.bet_name, handi=excluded.handi, win_txt=excluded.win_txt,
        draw_txt=excluded.draw_txt, lose_txt=excluded.lose_txt, status=excluded.status,
        result=excluded.result, score=excluded.score, updated_at=excluded.updated_at,
-       sgl=COALESCE(excluded.sgl, proto_matches.sgl)`
+       sgl=COALESCE(excluded.sgl, proto_matches.sgl), domestic=COALESCE(excluded.domestic, proto_matches.domestic)
+     -- 바뀐 것이 없으면 쓰지 않는다 (D1 무료 쓰기 한도 절약)
+     WHERE proto_matches.league IS NOT excluded.league OR proto_matches.home IS NOT excluded.home
+       OR proto_matches.away IS NOT excluded.away OR proto_matches.game_ts IS NOT excluded.game_ts
+       OR proto_matches.bet_name IS NOT excluded.bet_name OR proto_matches.handi IS NOT excluded.handi
+       OR proto_matches.win_txt IS NOT excluded.win_txt OR proto_matches.draw_txt IS NOT excluded.draw_txt
+       OR proto_matches.lose_txt IS NOT excluded.lose_txt OR proto_matches.status IS NOT excluded.status
+       OR proto_matches.result IS NOT excluded.result OR proto_matches.score IS NOT excluded.score
+       OR (excluded.sgl IS NOT NULL AND proto_matches.sgl IS NOT excluded.sgl)
+       OR (excluded.domestic IS NOT NULL AND proto_matches.domestic IS NOT excluded.domestic)`
   );
   // 직전 스냅샷과 같으면 넣지 않는다
   const snap = db.prepare(
@@ -63,7 +83,8 @@ export function ingestStmts(db, gmTs, rows) {
       gmTs, r.matchSeq, r.leagueShortName || r.leagueName || null, r.homeName ?? null, r.awayName ?? null,
       Math.floor(r.gameDate / 1000), r.betId ?? null, r.betNm ?? null, handi,
       r.winTxt ?? null, r.drawTxt ?? null, r.loseTxt ?? null, r.protoStatus ?? null,
-      r.gameResult ?? null, r.mchScore ?? null, ts, r.sgl ?? null
+      r.gameResult ?? null, r.mchScore ?? null, ts, r.sgl ?? null,
+      r.domastic === true ? 1 : r.domastic === false ? 0 : null
     ));
     const [w, d, l] = [num(r.winAllot), num(r.drawAllot), num(r.loseAllot)];
     if (w || d || l) out.push(snap.bind(gmTs, r.matchSeq, w, d, l, handi, ts));
@@ -75,7 +96,9 @@ async function runBatch(db, stmts) {
   for (let i = 0; i < stmts.length; i += 200) await db.batch(stmts.slice(i, i + 200));
 }
 
-const isMain = (b) => /승무패$/.test(b.bet_name || "") && !/전반/.test(b.bet_name || "");
+// 기본 게임: 축구는 승무패 야구 농구 배구는 승패
+const isMain = (b) => /(승무패|승패)$/.test(b.bet_name || "") && !/전반/.test(b.bet_name || "");
+const mainOf = (g) => g.bets.find((b) => isMain(b) && b.w && b.l);
 
 // 경기(홈/원정/시각) 단위로 게임 유형들을 묶는다
 function groupGames(rows) {
@@ -83,9 +106,11 @@ function groupGames(rows) {
   for (const r of rows) {
     const key = `${r.game_ts}|${r.home}|${r.away}`;
     if (!games.has(key)) {
-      games.set(key, { game_ts: r.game_ts, league: r.league, home: r.home, away: r.away, score: null, bets: [] });
+      games.set(key, { game_ts: r.game_ts, league: r.league, home: r.home, away: r.away, score: null,
+                       sport: sportOf(r.bet_name), domestic: null, bets: [] });
     }
     const g = games.get(key);
+    if (r.domestic != null) g.domestic = r.domestic;
     // 점수는 전체 승무패 행 기준 (핸디캡과 언더오버 행은 보정된 값이 들어온다)
     if (isMain(r) && isFinished(r)) g.score = r.score;
     g.bets.push(r);
@@ -125,66 +150,91 @@ export async function loadGames(db, { from, to, by = "game_ts" }) {
 }
 
 export const isKLeague = (name) => /^K\s?[12]?\s?리그/.test(name || "");
+// 베트맨 국내 표시가 없던 행은 국내 리그 이름으로 판단한다
+const DOMESTIC_RE = /^(?:K\s?[12]?\s?리그|WK리그|KBO|KBL|WKBL|KOVO|V-?리그|남농|여농|남배|여배)/;
+export const isDomestic = (g) => g.domestic === 1 || (g.domestic == null && DOMESTIC_RE.test(g.league || ""));
 
-async function pageData(db) {
+async function pageData(db, sport = "", ctx) {
   const now = Math.floor(Date.now() / 1000);
-  // 해외 리그도 저장하지만 이 화면은 K리그만 보여 준다
-  const games = (await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY })).filter((g) => isKLeague(g.league));
+  // 해외 리그도 저장하지만 이 화면은 국내 리그만 보여 준다
+  const all = (await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY })).filter(isDomestic);
+  const counts = Object.fromEntries(SPORTS.map((s) => [s, all.filter((g) => g.sport === s && !g.score).length]));
+  const games = sport ? all.filter((g) => g.sport === sport) : all;
   return {
+    sport, counts,
     upcoming: games.filter((g) => g.game_ts >= now - 3 * 3600 && !g.score),
-    recent: games.filter((g) => g.score).reverse(),
-    accuracy: await accuracyData(db),
+    recent: games.filter((g) => g.score).reverse().slice(0, 40),
+    accuracy: await accuracyCached(db, sport, ctx),
   };
 }
 
 // ---------- 예상과 결과 ----------
 // 배당이 가장 낮은 쪽(정배)이 배당의 예상이다. 마진을 뺀 확률이 예상 적중률이고 실제 결과와 비교한다.
 
+// d 가 없으면 무승부 없는 승패 게임 (야구 농구 배구)
 export function favoriteOf(w, d, l) {
-  const odds = [w, d, l];
-  const inv = odds.map((x) => 1 / x);
+  const odds = [w, d > 1 ? d : null, l];
+  const inv = odds.map((x) => (x ? 1 / x : 0));
   const sum = inv[0] + inv[1] + inv[2];
-  const fav = odds.indexOf(Math.min(...odds));
+  const fav = odds.indexOf(Math.min(...odds.filter(Boolean)));
   const dog = w >= l ? 0 : 2;  // 홈과 원정 중 배당이 높은 쪽
-  return { fav, dog, probs: inv.map((x) => x / sum) };
+  return { fav, dog, probs: inv.map((x) => x / sum), margin: sum - 1 };
 }
 
 const BUCKETS = [[0, 1.5, "1.5 미만"], [1.5, 2.0, "1.5~2.0"], [2.0, 2.5, "2.0~2.5"], [2.5, 99, "2.5 이상"]];
 
-// rows: {season, w, d, l, result("0"|"1"|"2")}
+// rows: {season, league, w, d, l, result("0"|"1"|"2")}. d 가 없으면 승패 게임
 export function accuracy(rows) {
   const blank = () => ({ n: 0, exp: 0, hit: 0, ret: 0 });
   const total = blank(), draw = blank(), dog = blank();
   const buckets = BUCKETS.map(([lo, hi, label]) => ({ lo, hi, label, ...blank() }));
-  const seasons = {};
+  const seasons = {}, leagues = {};
   const add = (acc, p, won, odd) => { acc.n++; acc.exp += p; acc.hit += won ? 1 : 0; acc.ret += won ? odd : 0; };
   for (const r of rows) {
-    const odds = [r.w, r.d, r.l];
-    if (!odds.every((x) => x > 1)) continue;
+    if (!(r.w > 1 && r.l > 1)) continue;
+    const odds = [r.w, r.d > 1 ? r.d : null, r.l];
     const res = Number(r.result);
+    if (res === 1 && !odds[1]) continue;  // 승패 게임에 무승부 결과는 적특이라 뺀다
     const f = favoriteOf(r.w, r.d, r.l);
     const favOdd = odds[f.fav];
-    add(total, f.probs[f.fav], res === f.fav, favOdd);
-    add(buckets.find((b) => favOdd >= b.lo && favOdd < b.hi), f.probs[f.fav], res === f.fav, favOdd);
-    add((seasons[r.season] ||= blank()), f.probs[f.fav], res === f.fav, favOdd);
-    add(draw, f.probs[1], res === 1, r.d);
+    const won = res === f.fav;
+    add(total, f.probs[f.fav], won, favOdd);
+    add(buckets.find((b) => favOdd >= b.lo && favOdd < b.hi), f.probs[f.fav], won, favOdd);
+    add((seasons[r.season] ||= blank()), f.probs[f.fav], won, favOdd);
+    if (r.league) add((leagues[r.league] ||= blank()), f.probs[f.fav], won, favOdd);
+    if (odds[1]) add(draw, f.probs[1], res === 1, r.d);
     add(dog, f.probs[f.dog], res === f.dog, odds[f.dog]);
   }
   return { total, buckets: buckets.filter((b) => b.n), draw, dog,
-           seasons: Object.entries(seasons).sort().map(([season, acc]) => ({ season, ...acc })) };
+           seasons: Object.entries(seasons).sort().map(([season, acc]) => ({ season, ...acc })),
+           leagues: Object.entries(leagues).sort((a, b) => b[1].n - a[1].n).map(([league, acc]) => ({ league, ...acc })) };
 }
 
-async function accuracyData(db) {
+async function accuracyData(db, sport = "") {
   const { results } = await db
     .prepare(
-      `SELECT m.game_ts, m.result, o.win AS w, o.draw AS d, o.lose AS l
+      `SELECT m.game_ts, m.league, m.bet_name, m.domestic, m.result, o.win AS w, o.draw AS d, o.lose AS l
        FROM proto_matches m
        JOIN proto_odds o ON o.id = (SELECT MAX(id) FROM proto_odds WHERE gm_ts = m.gm_ts AND match_seq = m.match_seq)
-       WHERE m.bet_name = '축구 승무패' AND m.status IN ('4', '20') AND m.result IN ('0', '1', '2')
-         AND (m.league LIKE 'K리그%' OR m.league LIKE 'K1%' OR m.league LIKE 'K2%')`
+       WHERE (m.bet_name LIKE '%승무패' OR m.bet_name LIKE '%승패') AND m.bet_name NOT LIKE '%전반%'
+         AND m.status IN ('4', '20') AND m.result IN ('0', '1', '2')`
     )
     .all();
-  return accuracy(results.map((r) => ({ ...r, season: new Date((r.game_ts + 9 * 3600) * 1000).getUTCFullYear() })));
+  return accuracy(results
+    .filter((r) => isDomestic(r) && (!sport || sportOf(r.bet_name) === sport))
+    .map((r) => ({ ...r, season: new Date((r.game_ts + 9 * 3600) * 1000).getUTCFullYear() })));
+}
+
+// 적중률은 끝난 경기 전체를 읽으므로 1시간 캐시한다 (D1 무료 읽기 한도 절약)
+async function accuracyCached(db, sport, ctx) {
+  if (typeof caches === "undefined") return accuracyData(db, sport);
+  const key = new Request(`https://kl.usb.kr/__cache/accuracy?sport=${encodeURIComponent(sport)}`);
+  const hit = await caches.default.match(key);
+  if (hit) return hit.json();
+  const data = await accuracyData(db, sport);
+  const put = caches.default.put(key, Response.json(data, { headers: { "cache-control": "public, max-age=3600" } }));
+  if (ctx) ctx.waitUntil(put); else await put;
+  return data;
 }
 
 // ---------- 배당 변경 ----------
@@ -234,8 +284,10 @@ function cell(label, v, v0, v1, hit, recent) {
   return `<td class="${cls}"><span class="lbl">${esc(label)}</span>${prev}${v.toFixed(2)}${move}</td>`;
 }
 
+const stripSport = (name) => String(name || "").replace(/^(축구|야구|농구|배구)\s*/, "");
+
 function betRow(b) {
-  const name = String(b.bet_name || "").replace(/^축구\s*/, "");
+  const name = stripSport(b.bet_name);
   const ou = /언더오버/.test(name);
   const c = isFinished(b) ? null : betChange(b);
   const recent = c && c.kind === "changed";
@@ -255,14 +307,13 @@ function betRow(b) {
 }
 
 function probBar(g) {
-  const main = g.bets.find((b) => isMain(b) && b.w && b.d && b.l);
+  const main = mainOf(g);
   if (!main) return "";
-  const inv = [main.w, main.d, main.l].map((x) => 1 / x);
-  const sum = inv[0] + inv[1] + inv[2];
+  const { probs, margin } = favoriteOf(main.w, main.d, main.l);
   const seg = ["home", "draw", "away"]
-    .map((c, i) => `<span class="${c}" style="flex:${inv[i]}">${((inv[i] / sum) * 100).toFixed(0)}%</span>`)
+    .map((c, i) => (probs[i] ? `<span class="${c}" style="flex:${probs[i]}">${(probs[i] * 100).toFixed(0)}%</span>` : ""))
     .join("");
-  return `<div class="bar">${seg}</div><p class="muted small">마진 ${((sum - 1) * 100).toFixed(1)}% · 마진 제외 확률</p>`;
+  return `<div class="bar">${seg}</div><p class="muted small">마진 ${(margin * 100).toFixed(1)}% · 마진 제외 확률</p>`;
 }
 
 // 경기별 링크: 베트맨 회차 화면(마감 전은 구매 화면)과 네이버 경기 정보
@@ -287,11 +338,12 @@ const man = (x) => {
 const won = (x) => `${x >= 0 ? "+" : "-"}${comma(x)}원`;
 
 function verdict(g) {
-  const main = g.bets.find((b) => isMain(b) && b.w && b.d && b.l);
+  const main = mainOf(g);
   if (!g.score || !main || !["0", "1", "2"].includes(String(main.result))) return "";
   const { fav } = favoriteOf(main.w, main.d, main.l);
   const res = Number(main.result);
   const odd = [main.w, main.d, main.l][fav];
+  if (res === 1 && !(main.d > 1)) return "";  // 승패 게임 적특
   if (res === fav) return `<span class="badge hit">정배 적중 · 10만원 → ${won((odd - 1) * STAKE)}</span>`;
   return `<span class="badge miss">${res === 1 ? "무승부" : "이변"} · 정배 ${["홈승", "무", "원정승"][fav]} 실패 · 10만원 → ${won(-STAKE)}</span>`;
 }
@@ -318,7 +370,7 @@ function changeList(upcoming) {
   if (!list.length) return "";
   const pick = (b, now, prev) => (prev && prev !== now ? `${prev.toFixed(2)}→<b>${now.toFixed(2)}</b>` : null);
   const rows = list.slice(0, 12).map(({ g, b, sec }) => {
-    const name = String(b.bet_name || "").replace(/^축구\s*/, "");
+    const name = stripSport(b.bet_name);
     const parts = [
       [b.win_txt || "승", pick(b, b.w, b.w1)],
       [b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", pick(b, b.d, b.d1)],
@@ -339,17 +391,20 @@ function accRow(label, a) {
     <td class="${roi >= 0 ? "up" : "down"}">${man((a.ret - a.n) * STAKE)}</td></tr>`;
 }
 
-function accuracySection(acc) {
+function accuracySection(acc, sport) {
   if (!acc || !acc.total.n) return "";
+  const main = sport === "축구" ? "승무패" : sport ? "승패" : "승무패 (축구) 와 승패 (야구 농구 배구)";
   const head = `<thead><tr><th></th><th>경기</th><th>예상</th><th>실제</th><th>차이</th><th>수익률</th><th>손익</th></tr></thead>`;
   return `<h3 id="accuracy">배당 예상 vs 실제 결과</h3>
   <section>
-    <p class="muted small">K리그 승무패 마감 배당 기준 · 정배는 배당이 가장 낮은 쪽 · 역배는 홈승과 원정승 중 배당이 높은 쪽 · 예상은 마진을 뺀 배당 확률 · 수익률은 매번 같은 금액을 걸었을 때 · 손익은 경기마다 10만원을 걸었을 때 총 손익 (만원)</p>
+    <p class="muted small">${esc(sport || "전 종목")} 국내 리그 ${esc(main)} 마감 배당 기준 · 정배는 배당이 가장 낮은 쪽 · 역배는 홈승과 원정승 중 배당이 높은 쪽 · 예상은 마진을 뺀 배당 확률 · 수익률은 매번 같은 금액을 걸었을 때 · 손익은 경기마다 10만원을 걸었을 때 총 손익 (만원)</p>
     <div class="scroll"><table class="acc">${head}<tbody>
       ${accRow("정배", acc.total)}
-      ${accRow("무승부", acc.draw)}
+      ${acc.draw.n ? accRow("무승부", acc.draw) : ""}
       ${accRow("역배", acc.dog)}
     </tbody></table></div>
+    <h4>리그별 정배</h4>
+    <div class="scroll"><table class="acc">${head}<tbody>${acc.leagues.map((x) => accRow(x.league, x)).join("")}</tbody></table></div>
     <h4>정배 배당 구간별</h4>
     <div class="scroll"><table class="acc">${head}<tbody>${acc.buckets.map((b) => accRow(b.label, b)).join("")}</tbody></table></div>
     <h4>시즌별 정배</h4>
@@ -358,10 +413,16 @@ function accuracySection(acc) {
   </section>`;
 }
 
-function page({ upcoming, recent, accuracy }) {
+function tabs(sport, counts) {
+  const link = (s, label) =>
+    `<a href="${s ? `/?sport=${encodeURIComponent(s)}` : "/"}" class="${s === sport ? "on" : ""}">${label}</a>`;
+  return `<nav class="tabs">${link("", "전체")}${SPORTS.map((s) => link(s, `${s} <small>${counts[s] || 0}</small>`)).join("")}</nav>`;
+}
+
+function page({ sport, counts, upcoming, recent, accuracy }) {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>K리그 프로토 배당</title>
+<title>국내 프로토 배당</title>
 <style>
 :root{--chg:#fef3c7;--chg-fg:#b45309;--bg:#f6f7f9;--card:#fff;--fg:#14161a;--muted:#6b7280;--line:#e5e7eb;--home:#2563eb;--draw:#9ca3af;--away:#dc2626;--up:#dc2626;--down:#2563eb;--hit:#dcfce7}
 @media (prefers-color-scheme:dark){:root{--chg:#422006;--chg-fg:#f59e0b;--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--muted:#9097a3;--line:#2a2e36;--home:#3b82f6;--draw:#6b7280;--away:#ef4444;--up:#f87171;--down:#60a5fa;--hit:#14532d}}
@@ -387,6 +448,8 @@ h2 a{color:inherit;text-decoration:none}h2 a:hover{text-decoration:underline}
 .badge.hit{background:var(--hit);color:var(--fg)}.badge.miss{background:#fee2e2;color:#991b1b}
 h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:12px;white-space:nowrap;padding:6px 4px}
 .badge.single{background:var(--hit);color:var(--fg)}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.tabs a{padding:4px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--fg);text-decoration:none;font-size:14px}
+.tabs a.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}.tabs small{margin-left:2px;color:inherit;opacity:.7;display:inline}
 .badge.changed{background:var(--chg);color:var(--chg-fg)}.badge.fresh{background:var(--line);color:var(--fg)}
 article.has-change{border-color:var(--chg-fg);box-shadow:0 0 0 1px var(--chg-fg) inset}
 td.flip{background:var(--chg)}s.prev{color:var(--muted);font-size:11px;margin-right:4px}
@@ -395,12 +458,13 @@ small{margin-left:4px;font-size:11px}.up{color:var(--up)}.down{color:var(--down)
 article header{flex-wrap:wrap}.tag{white-space:nowrap}
 @media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
 </style></head><body><main>
-<h1>K리그 프로토 배당</h1>
+<h1>국내 프로토 배당</h1>
 <p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <a href="#accuracy">예상 적중률 보기</a></p>
+${tabs(sport, counts)}
 ${changeList(upcoming)}
-${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 K리그 프로토 경기가 없거나 아직 수집 전입니다</section>`}
+${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 ${esc(sport || "국내")} 프로토 경기가 없거나 아직 수집 전입니다</section>`}
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
-${accuracySection(accuracy)}
+${accuracySection(accuracy, sport)}
 </main></body></html>`;
 }
 
@@ -431,13 +495,13 @@ async function exportCsv(db, url) {
   return new Response("\ufeff" + lines.join("\n"), {
     headers: {
       "content-type": "text/csv; charset=utf-8",
-      "content-disposition": 'attachment; filename="kleague_proto.csv"',
+      "content-disposition": 'attachment; filename="proto.csv"',
     },
   });
 }
 
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const url = new URL(req.url);
     if (url.pathname === "/ingest" && req.method === "POST") {
       const auth = req.headers.get("authorization") || "";
@@ -452,8 +516,9 @@ export default {
       await runBatch(env.DB, stmts);
       return Response.json({ ok: true, rows: body.rows.length });
     }
-    if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB));
-    if (url.pathname === "/api/accuracy") return Response.json(await accuracyData(env.DB));
+    const sport = SPORTS.includes(url.searchParams.get("sport")) ? url.searchParams.get("sport") : "";
+    if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB, sport, ctx));
+    if (url.pathname === "/api/accuracy") return Response.json(await accuracyCached(env.DB, sport, ctx));
     if (url.pathname === "/export.csv") return exportCsv(env.DB, url);
     if (url.pathname === "/api/rounds") {
       // 저장된 회차별 경기 수. 내보내기를 나눠 받을 때 쓴다
@@ -463,7 +528,7 @@ export default {
       return Response.json(results);
     }
     if (url.pathname !== "/") return new Response("not found", { status: 404 });
-    return new Response(page(await pageData(env.DB)), {
+    return new Response(page(await pageData(env.DB, sport, ctx)), {
       headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=120" },
     });
   },
