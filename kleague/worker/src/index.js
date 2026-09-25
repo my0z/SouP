@@ -35,12 +35,15 @@ export const isFinished = (b) => ["4", "20"].includes(String(b.status)) && !!b.s
 export function ingestStmts(db, gmTs, rows) {
   const ts = nowIso();
   const upsert = db.prepare(
-    `INSERT INTO proto_matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `INSERT INTO proto_matches (gm_ts, match_seq, league, home, away, game_ts, bet_id, bet_name, handi,
+       win_txt, draw_txt, lose_txt, status, result, score, updated_at, sgl)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(gm_ts, match_seq) DO UPDATE SET
        league=excluded.league, home=excluded.home, away=excluded.away, game_ts=excluded.game_ts,
        bet_name=excluded.bet_name, handi=excluded.handi, win_txt=excluded.win_txt,
        draw_txt=excluded.draw_txt, lose_txt=excluded.lose_txt, status=excluded.status,
-       result=excluded.result, score=excluded.score, updated_at=excluded.updated_at`
+       result=excluded.result, score=excluded.score, updated_at=excluded.updated_at,
+       sgl=COALESCE(excluded.sgl, proto_matches.sgl)`
   );
   // 직전 스냅샷과 같으면 넣지 않는다
   const snap = db.prepare(
@@ -59,7 +62,7 @@ export function ingestStmts(db, gmTs, rows) {
       gmTs, r.matchSeq, r.leagueShortName || r.leagueName || null, r.homeName ?? null, r.awayName ?? null,
       Math.floor(r.gameDate / 1000), r.betId ?? null, r.betNm ?? null, handi,
       r.winTxt ?? null, r.drawTxt ?? null, r.loseTxt ?? null, r.protoStatus ?? null,
-      r.gameResult ?? null, r.mchScore ?? null, ts
+      r.gameResult ?? null, r.mchScore ?? null, ts, r.sgl ?? null
     ));
     const [w, d, l] = [num(r.winAllot), num(r.drawAllot), num(r.loseAllot)];
     if (w || d || l) out.push(snap.bind(gmTs, r.matchSeq, w, d, l, handi, ts));
@@ -190,7 +193,10 @@ function betRow(b) {
     : "";
   const badge = c ? `<span class="badge ${c.kind}">${c.kind === "fresh" ? "새 배당" : "변경"} ${ago(c.sec)}</span>` : "";
   const hit = RESULT_IDX[b.result];
-  return `<tr class="${recent ? "moved" : ""}"><th>${esc(name)}${handi}${badge}</th>
+  // 베트맨 화면과 판매점 용지에서 찾는 경기 번호. sgl 1 은 1경기만 사는 단폴이 가능한 경기
+  const no = `<span class="no">${esc(b.match_seq)}</span>`;
+  const single = String(b.sgl) === "1" ? `<span class="badge single">단폴</span>` : "";
+  return `<tr class="${recent ? "moved" : ""}"><th>${no}${esc(name)}${handi}${single}${badge}</th>
     ${cell(b.win_txt || "승", b.w, b.w0, b.w1, hit === 0, recent)}
     ${cell(b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.d, b.d0, b.d1, hit === 1, recent)}
     ${cell(b.lose_txt || "패", b.l, b.l0, b.l1, hit === 2, recent)}</tr>`;
@@ -259,6 +265,8 @@ th,td{padding:6px 8px;border-top:1px solid var(--line);text-align:right;white-sp
 th{text-align:left;font-weight:500}td.hit{background:var(--hit);font-weight:700}td.na{color:var(--muted)}
 .lbl{color:var(--muted);font-size:12px;margin-right:4px}
 .badge{display:inline-block;margin-left:6px;padding:0 6px;border-radius:6px;font-size:11px;font-weight:700;vertical-align:1px}
+.no{display:inline-block;min-width:34px;margin-right:6px;font-size:12px;font-weight:700;color:var(--muted);font-variant-numeric:tabular-nums}
+.badge.single{background:var(--hit);color:var(--fg)}
 .badge.changed{background:var(--chg);color:var(--chg-fg)}.badge.fresh{background:var(--line);color:var(--fg)}
 article.has-change{border-color:var(--chg-fg);box-shadow:0 0 0 1px var(--chg-fg) inset}
 td.flip{background:var(--chg)}s.prev{color:var(--muted);font-size:11px;margin-right:4px}
@@ -268,7 +276,7 @@ article header{flex-wrap:wrap}.tag{white-space:nowrap}
 @media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
 </style></head><body><main>
 <h1>K리그 프로토 배당</h1>
-<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당</p>
+<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능</p>
 ${changeList(upcoming)}
 ${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 K리그 프로토 경기가 없거나 아직 수집 전입니다</section>`}
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}

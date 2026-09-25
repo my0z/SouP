@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS proto_matches (
     result       TEXT,               -- 0=승(왼쪽) 1=무 2=패(오른쪽) 4=적특
     score        TEXT,
     updated_at   TEXT NOT NULL,
+    sgl          TEXT,               -- 1 이면 단폴(1경기) 구매 가능
     PRIMARY KEY (gm_ts, match_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_proto_matches_game ON proto_matches (game_ts);
