@@ -2,7 +2,7 @@
 //   베트맨은 해외 IP를 막으므로 국내 PC의 betman_collector.py 가 수집해서 /ingest 로 보낸다.
 //   POST /ingest       : 수집기가 보낸 compSchedules 행 저장 (INGEST_TOKEN 필요)
 //   GET  /             : 다가오는 경기의 게임 유형별 배당과 첫 수집 대비 변동, 최근 결과 (?sport=야구 로 종목 선택)
-//   GET  /api/upcoming : 같은 데이터를 JSON 으로
+//   GET  /api/upcoming : 같은 데이터를 JSON 으로. 해외(MLB NBA 해외 축구 등)까지 전부 (?scope=domestic 이면 국내만)
 //   GET  /export.csv   : 저장된 경기와 배당 CSV (분석용. gm_from gm_to league 로 나눠 받기)
 //   GET  /api/rounds   : 회차별 리그별 경기 수
 //   GET  /api/accuracy : 국내 경기 배당 예상과 실제 결과 비교 (?sport=야구)
@@ -10,7 +10,7 @@
 //   GET  /api/picks    : 베팅 추천 근거 (과거 검증 결과와 후했던 배당 구간. src/picks.js)
 
 import { runAlerts, kakaoLogin, kakaoCallback, alertsPending, alertsAck } from "./alerts.js";
-import { Model, buildModel, backtest, goodBuckets, MIN_EV, MIN_N } from "./picks.js";
+import { Model, aggSql, modelFromAgg, backtestAgg, goodBuckets, MIN_EV, MIN_N } from "./picks.js";
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -157,19 +157,38 @@ export async function loadGames(db, { from, to, by = "game_ts" }) {
 export const isKLeague = (name) => /^K\s?[12]?\s?리그/.test(name || "");
 // 베트맨 국내 표시가 없던 행은 국내 리그 이름으로 판단한다
 const DOMESTIC_RE = /^(?:K\s?[12]?\s?리그|WK리그|KBO|KBL|WKBL|KOVO|V-?리그|남농|여농|남배|여배)/;
-export const isDomestic = (g) => g.domestic === 1 || (g.domestic == null && DOMESTIC_RE.test(g.league || ""));
+export const isDomestic = (g) => g.domestic === 1 || g.domestic === true || (g.domestic == null && DOMESTIC_RE.test(g.league || ""));
 
-async function pageData(db, sport = "", ctx) {
+// 최근 3일 ~ 앞으로 14일 경기. 종목 탭과 API 가 같은 목록을 쓰도록 10분 캐시한다 (D1 읽기 절약)
+async function recentGames(db, ctx) {
+  const make = async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const games = await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY });
+    for (const g of games) g.domestic = isDomestic(g);
+    return games;
+  };
+  if (typeof caches === "undefined") return make();
+  const key = new Request("https://kl.usb.kr/__cache/recent-games");
+  const hit = await caches.default.match(key);
+  if (hit) return hit.json();
+  const games = await make();
+  const put = caches.default.put(key, Response.json(games, { headers: { "cache-control": `public, max-age=${PAGE_TTL}` } }));
+  if (ctx) ctx.waitUntil(put); else await put;
+  return games;
+}
+
+// domesticOnly: 화면은 국내만. /api/upcoming 은 해외(MLB NBA 해외 축구 등)까지 전부 준다
+async function pageData(db, { sport = "", ctx, domesticOnly = true } = {}) {
   const now = Math.floor(Date.now() / 1000);
-  // 해외 리그도 저장하지만 이 화면은 국내 리그만 보여 준다
-  const all = (await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY })).filter(isDomestic);
+  const loaded = await recentGames(db, ctx);
+  const all = domesticOnly ? loaded.filter((g) => g.domestic) : loaded;
   const counts = Object.fromEntries(SPORTS.map((s) => [s, all.filter((g) => g.sport === s && !g.score).length]));
   const games = sport ? all.filter((g) => g.sport === sport) : all;
-  const pk = await picksCached(db, ctx);
-  const model = new Model(pk.model);
+  const stats = await getStats(db, ctx);
+  const model = new Model(stats.picks.model);
   const picks = [];
   for (const g of games) {
-    if (g.score || g.game_ts < now) continue;
+    if (g.score || g.game_ts < now || !g.domestic) continue;  // 추천 근거는 국내 경기 기록이라 국내만
     for (const b of g.bets) {
       b.picks = model.picks(b);
       for (const p of b.picks) picks.push({ g, b, p });
@@ -177,10 +196,10 @@ async function pageData(db, sport = "", ctx) {
   }
   picks.sort((a, b) => b.p.ev - a.p.ev);
   return {
-    sport, counts, picks, backtest: pk.backtest,
+    sport, counts, picks, backtest: stats.picks.backtest,
     upcoming: games.filter((g) => g.game_ts >= now - 3 * 3600 && !g.score),
-    recent: games.filter((g) => g.score).reverse().slice(0, 40),
-    accuracy: await accuracyCached(db, sport, ctx),
+    recent: games.filter((g) => g.score).reverse().slice(0, domesticOnly ? 40 : 200),
+    accuracy: accuracyFromAgg(stats.accuracy, sport),
   };
 }
 
@@ -197,89 +216,87 @@ export function favoriteOf(w, d, l) {
   return { fav, dog, probs: inv.map((x) => x / sum), margin: sum - 1 };
 }
 
-const BUCKETS = [[0, 1.5, "1.5 미만"], [1.5, 2.0, "1.5~2.0"], [2.0, 2.5, "2.0~2.5"], [2.5, 99, "2.5 이상"]];
+const BUCKETS = ["1.5 미만", "1.5~2.0", "2.0~2.5", "2.5 이상"];
 
-// rows: {season, league, w, d, l, result("0"|"1"|"2")}. d 가 없으면 승패 게임
-export function accuracy(rows) {
+// 국내 리그 조건 (SQL). 베트맨 국내 표시가 없던 과거 행은 리그 이름으로 본다 (DOMESTIC_RE 와 같은 뜻)
+const DOMESTIC_SQL = `(m.domestic = 1 OR (m.domestic IS NULL AND (${
+  ["K리그%", "K1%", "K2%", "WK리그%", "KBO%", "KBL%", "WKBL%", "KOVO%", "V리그%", "V-리그%", "남농%", "여농%", "남배%", "여배%"]
+    .map((x) => `m.league LIKE '${x}'`).join(" OR ")})))`;
+
+// 기본 게임(승무패 / 승패)의 정배 · 무승부 · 역배 결과를 (종목 리그 시즌 정배배당구간) 별로 SQL 이 더한다
+const ACCURACY_SQL = `
+  WITH f AS (
+    SELECT substr(m.bet_name, 1, instr(m.bet_name, ' ') - 1) AS sport, m.league,
+      strftime('%Y', m.game_ts + 32400, 'unixepoch') AS season, CAST(m.result AS INTEGER) AS r,
+      o.win AS w, CASE WHEN o.draw > 1 THEN o.draw END AS d, o.lose AS l
+    FROM proto_matches m
+    JOIN proto_odds o ON o.id = (SELECT MAX(id) FROM proto_odds WHERE gm_ts = m.gm_ts AND match_seq = m.match_seq)
+    WHERE (m.bet_name LIKE '%승무패' OR m.bet_name LIKE '%승패') AND m.bet_name NOT LIKE '%전반%'
+      AND m.status IN ('4', '20') AND m.result IN ('0', '1', '2') AND o.win > 1 AND o.lose > 1 AND ${DOMESTIC_SQL}),
+  g AS (
+    SELECT *, 1.0 / w + COALESCE(1.0 / d, 0) + 1.0 / l AS s,
+      CASE WHEN w <= l AND (d IS NULL OR w <= d) THEN 0 WHEN d IS NOT NULL AND d <= l THEN 1 ELSE 2 END AS fav,
+      CASE WHEN w >= l THEN 0 ELSE 2 END AS dog
+    FROM f WHERE NOT (r = 1 AND d IS NULL)),
+  h AS (SELECT *, CASE fav WHEN 0 THEN w WHEN 1 THEN d ELSE l END AS fo, CASE dog WHEN 0 THEN w ELSE l END AS go FROM g)
+  SELECT sport, league, season, CASE WHEN fo < 1.5 THEN 0 WHEN fo < 2.0 THEN 1 WHEN fo < 2.5 THEN 2 ELSE 3 END AS bucket,
+    COUNT(*) AS n, SUM(1.0 / fo / s) AS fexp, SUM(r = fav) AS fhit, SUM(CASE WHEN r = fav THEN fo ELSE 0 END) AS fret,
+    SUM(d IS NOT NULL) AS dn, SUM(COALESCE(1.0 / d / s, 0)) AS dexp, SUM(r = 1) AS dhit, SUM(CASE WHEN r = 1 THEN d ELSE 0 END) AS dret,
+    SUM(1.0 / go / s) AS gexp, SUM(r = dog) AS ghit, SUM(CASE WHEN r = dog THEN go ELSE 0 END) AS gret
+  FROM h GROUP BY sport, league, season, bucket`;
+
+// agg: ACCURACY_SQL 결과. sport 가 비면 전 종목
+export function accuracyFromAgg(agg, sport = "") {
   const blank = () => ({ n: 0, exp: 0, hit: 0, ret: 0 });
   const total = blank(), draw = blank(), dog = blank();
-  const buckets = BUCKETS.map(([lo, hi, label]) => ({ lo, hi, label, ...blank() }));
+  const buckets = BUCKETS.map((label) => ({ label, ...blank() }));
   const seasons = {}, leagues = {};
-  const add = (acc, p, won, odd) => { acc.n++; acc.exp += p; acc.hit += won ? 1 : 0; acc.ret += won ? odd : 0; };
-  for (const r of rows) {
-    if (!(r.w > 1 && r.l > 1)) continue;
-    const odds = [r.w, r.d > 1 ? r.d : null, r.l];
-    const res = Number(r.result);
-    if (res === 1 && !odds[1]) continue;  // 승패 게임에 무승부 결과는 적특이라 뺀다
-    const f = favoriteOf(r.w, r.d, r.l);
-    const favOdd = odds[f.fav];
-    const won = res === f.fav;
-    add(total, f.probs[f.fav], won, favOdd);
-    add(buckets.find((b) => favOdd >= b.lo && favOdd < b.hi), f.probs[f.fav], won, favOdd);
-    add((seasons[r.season] ||= blank()), f.probs[f.fav], won, favOdd);
-    if (r.league) add((leagues[r.league] ||= blank()), f.probs[f.fav], won, favOdd);
-    if (odds[1]) add(draw, f.probs[1], res === 1, r.d);
-    add(dog, f.probs[f.dog], res === f.dog, odds[f.dog]);
+  const add = (acc, n, exp, hit, ret) => { acc.n += n; acc.exp += exp; acc.hit += hit; acc.ret += ret; };
+  for (const a of agg) {
+    if (sport && a.sport !== sport) continue;
+    for (const acc of [total, buckets[a.bucket], (seasons[a.season] ||= blank()), (leagues[a.league] ||= blank())]) {
+      add(acc, a.n, a.fexp, a.fhit, a.fret);
+    }
+    add(draw, a.dn, a.dexp, a.dhit, a.dret);
+    add(dog, a.n, a.gexp, a.ghit, a.gret);
   }
   return { total, buckets: buckets.filter((b) => b.n), draw, dog,
            seasons: Object.entries(seasons).sort().map(([season, acc]) => ({ season, ...acc })),
            leagues: Object.entries(leagues).sort((a, b) => b[1].n - a[1].n).map(([league, acc]) => ({ league, ...acc })) };
 }
 
-async function accuracyData(db, sport = "") {
-  const { results } = await db
-    .prepare(
-      `SELECT m.game_ts, m.league, m.bet_name, m.domestic, m.result, o.win AS w, o.draw AS d, o.lose AS l
-       FROM proto_matches m
-       JOIN proto_odds o ON o.id = (SELECT MAX(id) FROM proto_odds WHERE gm_ts = m.gm_ts AND match_seq = m.match_seq)
-       WHERE (m.bet_name LIKE '%승무패' OR m.bet_name LIKE '%승패') AND m.bet_name NOT LIKE '%전반%'
-         AND m.status IN ('4', '20') AND m.result IN ('0', '1', '2')`
-    )
-    .all();
-  return accuracy(results
-    .filter((r) => isDomestic(r) && (!sport || sportOf(r.bet_name) === sport))
-    .map((r) => ({ ...r, season: new Date((r.game_ts + 9 * 3600) * 1000).getUTCFullYear() })));
+// ---------- 과거 통계 (적중률과 추천 근거) ----------
+// 끝난 경기 전체를 훑는 무거운 계산이라 하루 한 번만 하고 결과를 D1 kv 에 둔다.
+// (전체 스캔 한 번이 D1 읽기 수십만 행이라 요청마다 하면 무료 읽기 한도 하루 500만을 넘는다)
+const STATS_TTL = 24 * 3600;
+
+async function computeStats(db) {
+  const [acc, pk] = await db.batch([db.prepare(ACCURACY_SQL), db.prepare(aggSql(DOMESTIC_SQL))]);
+  const model = modelFromAgg(pk.results);
+  const stats = {
+    at: Math.floor(Date.now() / 1000),
+    accuracy: acc.results,
+    picks: { model: model.toJSON(), backtest: backtestAgg(pk.results), good: goodBuckets(model),
+             rows: pk.results.reduce((s, a) => s + (a.side === 0 ? a.n : 0), 0) },
+  };
+  await db.prepare("INSERT INTO kv (key, value) VALUES ('stats', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .bind(JSON.stringify(stats)).run();
+  return stats;
 }
 
-// 추천용 과거 데이터: 끝난 게임 유형 전부와 마감 배당
-async function picksData(db) {
-  const { results } = await db
-    .prepare(
-      `SELECT m.game_ts, m.bet_name, m.result, o.win AS w, o.draw AS d, o.lose AS l
-       FROM proto_matches m
-       JOIN proto_odds o ON o.id = (SELECT MAX(id) FROM proto_odds WHERE gm_ts = m.gm_ts AND match_seq = m.match_seq)
-       WHERE m.status IN ('4', '20') AND m.result IN ('0', '1', '2') AND m.bet_name IS NOT NULL`
-    )
-    .all();
-  const model = buildModel(results);
-  return { model: model.toJSON(), backtest: backtest(results), good: goodBuckets(model), rows: results.length };
-}
-
-async function picksCached(db, ctx) {
-  return cached(`picks`, () => picksData(db), ctx);
-}
-
-async function cached(name, make, ctx) {
-  if (typeof caches === "undefined") return make();
-  const key = new Request(`https://kl.usb.kr/__cache/${name}`);
-  const hit = await caches.default.match(key);
-  if (hit) return hit.json();
-  const data = await make();
-  const put = caches.default.put(key, Response.json(data, { headers: { "cache-control": "public, max-age=3600" } }));
-  if (ctx) ctx.waitUntil(put); else await put;
-  return data;
-}
-
-// 적중률은 끝난 경기 전체를 읽으므로 1시간 캐시한다 (D1 무료 읽기 한도 절약)
-async function accuracyCached(db, sport, ctx) {
-  if (typeof caches === "undefined") return accuracyData(db, sport);
-  const key = new Request(`https://kl.usb.kr/__cache/accuracy?sport=${encodeURIComponent(sport)}`);
-  const hit = await caches.default.match(key);
-  if (hit) return hit.json();
-  const data = await accuracyData(db, sport);
-  const put = caches.default.put(key, Response.json(data, { headers: { "cache-control": "public, max-age=3600" } }));
-  if (ctx) ctx.waitUntil(put); else await put;
-  return data;
+let statsMemo = null;  // 같은 Worker 인스턴스 안에서 다시 읽지 않도록
+export async function getStats(db, ctx, force = false) {
+  const now = Math.floor(Date.now() / 1000);
+  if (!force && statsMemo && now - statsMemo.at < STATS_TTL) return statsMemo;
+  const row = force ? null : await db.prepare("SELECT value FROM kv WHERE key = 'stats'").first();
+  const saved = row ? JSON.parse(row.value) : null;
+  if (saved && now - saved.at < STATS_TTL) return (statsMemo = saved);
+  if (saved && ctx) {
+    // 오래된 값을 먼저 보여 주고 뒤에서 새로 계산한다
+    ctx.waitUntil(computeStats(db).then((s) => (statsMemo = s)));
+    return saved;
+  }
+  return (statsMemo = await computeStats(db));
 }
 
 // ---------- 배당 변경 ----------
@@ -340,11 +357,13 @@ const sideName = (b, side) =>
 function picksSection(picks, bt) {
   const roi = bt && bt.n ? bt.ret / bt.n - 1 : null;
   const verdict = roi == null
-    ? `아직 과거 검증할 데이터가 부족합니다.`
+    ? `아직 과거 검증할 데이터가 부족합니다 (시즌별로 앞 시즌 기록만 보고 다음 시즌을 맞혀 봅니다).`
     : `과거 검증: 같은 방법으로 ${bt.n}번 추천했다면 적중 ${pc(bt.hit / bt.n)} · 수익률 <b class="${roi >= 0 ? "up" : "down"}">${roi >= 0 ? "+" : ""}${pc(roi)}</b> · 10만원씩 ${won((bt.ret - bt.n) * STAKE)}`;
-  const warn = roi == null || roi < 0
-    ? `<p class="warn">⚠️ 과거 검증에서 아직 손해입니다. 데이터가 쌓여 검증 수익률이 + 가 되기 전까지는 참고만 하세요.</p>`
-    : "";
+  const warn = roi == null
+    ? `<p class="warn">⚠️ 과거 검증은 시즌이 2개 이상 쌓여야 합니다. 그 전까지는 참고만 하세요.</p>`
+    : roi < 0
+      ? `<p class="warn">⚠️ 과거 검증에서 아직 손해입니다. 데이터가 쌓여 검증 수익률이 + 가 되기 전까지는 참고만 하세요.</p>`
+      : "";
   const rows = picks.slice(0, 15).map(({ g, b, p }) => {
     const single = String(b.sgl) === "1" ? `<span class="badge single">단폴</span>` : "";
     const hd = b.handi ? ` ${/언더오버/.test(b.bet_name) ? "" : b.handi > 0 ? "+" : ""}${b.handi}` : "";
@@ -576,6 +595,21 @@ async function exportCsv(db, url) {
   });
 }
 
+// 화면과 /api/upcoming 은 10분 캐시한다. 요청마다 D1 을 1만 행 넘게 읽어서 조회가 잦으면 읽기 한도를 넘는다.
+// 수집이 30분마다라 10분이면 충분히 새롭다.
+const PAGE_TTL = 600;
+async function pageCached(req, ctx, make) {
+  if (typeof caches === "undefined") return make();
+  const key = new Request(req.url, { method: "GET" });
+  const hit = await caches.default.match(key);
+  if (hit) return hit;
+  const res = await make();
+  const out = new Response(res.body, res);
+  out.headers.set("cache-control", `public, max-age=${PAGE_TTL}`);
+  ctx.waitUntil(caches.default.put(key, out.clone()));
+  return out;
+}
+
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
@@ -606,12 +640,16 @@ export default {
     if (url.pathname === "/kakao/login") return kakaoLogin(env, url);
     if (url.pathname === "/kakao/callback") return kakaoCallback(env, url);
     const sport = SPORTS.includes(url.searchParams.get("sport")) ? url.searchParams.get("sport") : "";
-    if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB, sport, ctx));
-    if (url.pathname === "/api/picks") {
-      const { backtest: bt, good, rows } = await picksCached(env.DB, ctx);
-      return Response.json({ rows, backtest: bt, good, min_ev: MIN_EV, min_n: MIN_N });
+    if (url.pathname === "/api/upcoming") {
+      // 기본은 해외 포함 전부. ?scope=domestic 이면 국내만. 경기마다 domestic(true/false) 와 sport 가 있다
+      return pageCached(req, ctx, async () =>
+        Response.json(await pageData(env.DB, { sport, ctx, domesticOnly: url.searchParams.get("scope") === "domestic" })));
     }
-    if (url.pathname === "/api/accuracy") return Response.json(await accuracyCached(env.DB, sport, ctx));
+    if (url.pathname === "/api/picks") {
+      const { at, picks: { backtest: bt, good, rows } } = await getStats(env.DB, ctx);
+      return Response.json({ computed_at: at, rows, backtest: bt, good, min_ev: MIN_EV, min_n: MIN_N });
+    }
+    if (url.pathname === "/api/accuracy") return Response.json(accuracyFromAgg((await getStats(env.DB, ctx)).accuracy, sport));
     if (url.pathname === "/export.csv") return exportCsv(env.DB, url);
     if (url.pathname === "/api/rounds") {
       // 저장된 회차별 경기 수. 내보내기를 나눠 받을 때 쓴다
@@ -621,8 +659,8 @@ export default {
       return Response.json(results);
     }
     if (url.pathname !== "/") return new Response("not found", { status: 404 });
-    return new Response(page(await pageData(env.DB, sport, ctx)), {
-      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=120" },
-    });
+    return pageCached(req, ctx, async () => new Response(page(await pageData(env.DB, { sport, ctx })), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    }));
   },
 };

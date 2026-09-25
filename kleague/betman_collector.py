@@ -1,4 +1,4 @@
-"""베트맨 프로토 승부식 배당을 받아 국내 경기 전체(축구 야구 농구 배구)와 toto 해외 축구 리그를 골라 kl.usb.kr Worker로 보낸다.
+"""베트맨 프로토 승부식 배당을 모두(국내와 해외 전 종목) kl.usb.kr Worker로 보낸다.
 
 베트맨은 해외 IP를 막으므로 반드시 국내 IP 컴퓨터에서 실행해야 한다.
 
@@ -86,12 +86,21 @@ def rows_of(data):
     return [dict(zip(keys, row)) for row in datas]
 
 
-# 국내: 베트맨이 domastic 으로 표시한 리그는 모두 받는다 (K리그 KBO KBL WKBL V리그 코리아컵 ...).
-#   과거 회차처럼 표시가 없을 때를 위해 국내 리그 이름으로도 잡는다. 최근 회차는 "K리그1" 이고 짧게 "K1리그" 로 올 수도 있다.
-# 해외: toto 모델에 있는 리그의 베트맨 짧은 이름 (leagueShortName 과 정확히 일치)
+# 기본은 전부 받는다 (국내 K리그 KBO KBL WKBL V리그 + 해외 축구 MLB NBA NPB 해외 배구 ...).
+#   kl.usb.kr 화면은 국내만 보여 주고 /api/upcoming 은 전부 준다 (toto.usb.kr 이 해외 경기를 쓴다).
+# 국내 리그 이름: 베트맨 국내 표시(domastic)가 없던 과거 행을 알아볼 때 쓴다.
 DOMESTIC_LEAGUE = r"K\s?[12]?\s?리그|^(?:KBO|KBL|WKBL|KOVO|V-?리그|남농|여농|남배|여배)"
-OVERSEAS_LEAGUES = ["EPL", "EFL챔", "라리가", "세리에A", "분데스리", "프리그1", "에레디비", "J1리그", "MLS"]
-DEFAULT_LEAGUE = DOMESTIC_LEAGUE + r"|^(?:" + "|".join(map(re.escape, OVERSEAS_LEAGUES)) + r")$"
+DEFAULT_LEAGUE = ""  # 빈 정규식은 모든 리그와 맞는다
+
+# Worker 가 쓰는 칸만 보낸다 (전송량과 Worker 처리 시간 절약)
+SEND_KEYS = ("matchSeq", "leagueName", "leagueShortName", "homeName", "awayName", "gameDate", "betId", "betNm",
+             "handi", "winHandi", "winTxt", "drawTxt", "loseTxt", "protoStatus", "gameResult", "mchScore",
+             "winAllot", "drawAllot", "loseAllot", "sgl", "domastic", "itemCode")
+SEND_CHUNK = 300  # 한 번에 보내는 행 수 (Worker 한 요청이 너무 무거워지지 않게)
+
+
+def slim(row):
+    return {k: row[k] for k in SEND_KEYS if k in row}
 
 
 def filter_rows(rows, league_pattern, domestic=None):
@@ -138,6 +147,14 @@ def save_state(state, path=STATE_FILE):
         json.dump(state, f)
 
 
+def send_rows(url, token, gm_ts, rows):
+    """회차 행을 SEND_CHUNK 개씩 나눠 보낸다. 응답 목록을 돌려준다."""
+    out = []
+    for i in range(0, len(rows), SEND_CHUNK):
+        out.append(ingest(url, token, {"gmTs": gm_ts, "rows": [slim(r) for r in rows[i:i + SEND_CHUNK]]}))
+    return out
+
+
 def ingest(url, token, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
                                  headers={"Content-Type": "application/json",
@@ -160,14 +177,18 @@ def notify(url, token):
 EMPTY_ROUNDS_END_YEAR = 3   # 빈 회차가 3번 이어지면 그 해는 끝난 것으로 본다
 
 
-def backfill_step(state, league, send, max_rounds, sleep=time.sleep):
+def backfill_step(state, league, send, max_rounds, sleep=time.sleep, max_rows=None):
     """과거 회차를 커서부터 max_rounds 개까지 받아 send(gm_ts, rows)로 넘긴다.
+    max_rows: 보낸 행이 이만큼 넘으면 그 회차까지만 하고 멈춘다 (D1 무료 쓰기 한도 때문)
 
     state: {"year": 22, "no": 1, "empty": 0, "stop_at": 260113} 를 제자리에서 갱신한다.
     반환값: "done" (끝까지 받음) / "paused" (연속 실패) / "more" (다음 실행에서 계속)
     """
-    fails, had_success = 0, False
+    fails, had_success, sent = 0, False, 0
     for i in range(max_rounds):
+        if max_rows and sent >= max_rows:
+            print(f"이번 실행 행 한도 {max_rows} 도달 ({sent}행)")
+            return "more"
         gm_ts = state["year"] * 10000 + state["no"]
         if gm_ts >= state["stop_at"]:
             return "done"
@@ -199,6 +220,7 @@ def backfill_step(state, league, send, max_rounds, sleep=time.sleep):
         print(f"{gm_ts}: 전체 {len(rows)}행 중 대상 {len(picked)}행")
         if picked:
             send(gm_ts, picked)
+            sent += len(picked)
         state["no"] += 1
     return "more"
 
@@ -220,13 +242,13 @@ def run_backfill(args, url, token):
         if args.dry_run:
             return
         try:
-            print("  ", ingest(url, token, {"gmTs": gm_ts, "rows": rows}))
+            print("  ", " ".join(send_rows(url, token, gm_ts, rows)))
         except Exception as e:
             print(f"  전송 실패 ({e})")
             raise
 
     try:
-        result = backfill_step(state, args.league, send, args.rounds)
+        result = backfill_step(state, args.league, send, args.rounds, max_rows=args.max_rows)
     except Exception:
         result = "send_failed"  # Worker 전송 실패. 커서는 그대로라 다음에 같은 회차부터 다시 한다
     if result == "done":
@@ -244,12 +266,14 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="베트맨 프로토 승부식 국내 경기 배당 수집기")
     p.add_argument("--gmts", type=int, help="특정 회차만 수집 (예: 260113)")
     p.add_argument("--league", default=os.environ.get("LEAGUE_PATTERN", DEFAULT_LEAGUE),
-                   help="리그 이름 정규식 (기본값: 국내 전 종목과 toto 해외 리그 9개)")
+                   help="리그 이름 정규식 (기본값: 전부)")
     p.add_argument("--dry-run", action="store_true", help="Worker로 보내지 않고 출력만")
     p.add_argument("--no-jitter", action="store_true", help="시작 전 무작위 대기 생략")
     p.add_argument("--backfill", type=int, metavar="YEAR",
                    help="YEAR년 1회차부터 과거 회차를 이어서 수집 (예: 2022). 실행할 때마다 --rounds 개씩")
-    p.add_argument("--rounds", type=int, default=25, help="--backfill 한 번에 볼 회차 수 (기본 25. Cloudflare 무료 쓰기 한도 때문)")
+    p.add_argument("--rounds", type=int, default=25, help="--backfill 한 번에 볼 최대 회차 수")
+    p.add_argument("--max-rows", type=int, default=4000,
+                   help="--backfill 한 번에 보낼 최대 행 수 (기본 4000. 새 행 하나가 D1 쓰기 약 6번이라 하루 3번이면 약 7만)")
     args = p.parse_args(argv)
 
     state = load_state()
@@ -297,7 +321,7 @@ def main(argv=None):
                       f"[{r['betNm']} {r['winHandi']}] {r['winAllot']} {r['drawAllot']} {r['loseAllot']}")
         else:
             try:
-                print("  ", ingest(url, token, {"gmTs": gm_ts, "rows": picked}))
+                print("  ", " ".join(send_rows(url, token, gm_ts, picked)))
             except Exception as e:
                 print(f"  전송 실패 ({e})")
 

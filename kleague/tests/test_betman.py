@@ -31,7 +31,7 @@ class BetmanTest(unittest.TestCase):
         picked = bc.filter_rows(rows, "아시안게임")
         self.assertEqual({r["matchSeq"] for r in picked}, {4491, 4492, 4494})
         self.assertEqual(len(bc.filter_rows(rows, "MLB")), 1)  # 종목 제한 없음
-        self.assertEqual(len(bc.filter_rows(rows, bc.DEFAULT_LEAGUE)), 0)  # 해외 친선과 MLB 는 빠진다
+        self.assertEqual(len(bc.filter_rows(rows, bc.DEFAULT_LEAGUE)), len(rows))  # 기본은 전부
 
     def test_default_league_takes_all_domestic(self):
         def row(name, short, domastic=None, item="BS"):
@@ -40,21 +40,25 @@ class BetmanTest(unittest.TestCase):
                 row("남자프로농구", "KBL", None, "BK"), row("여자프로농구", "WKBL", None, "BK"),
                 row("아시안게임 여자농구", "AG여농", False, "BK"), row("V-리그 남자", "KOVO남", None, "VL"),
                 row("코리아컵", "코리아컵", True, "SC")]
-        picked = bc.filter_rows(rows, bc.DEFAULT_LEAGUE)
+        picked = bc.filter_rows(rows, bc.DOMESTIC_LEAGUE, domestic=True)
         self.assertEqual([r["leagueShortName"] for r in picked], ["KBO", "KBL", "WKBL", "KOVO남", "코리아컵"])
         # 리그를 직접 고르면 국내 표시만으로는 넣지 않는다
         self.assertEqual([r["leagueShortName"] for r in bc.filter_rows(rows, "KBL")], ["KBL", "WKBL"])
 
-    def test_default_league_matches_long_and_short_names(self):
-        def row(name, short=None):
-            return {"itemCode": "SC", "leagueName": name, "leagueShortName": short}
-        rows = [row("K리그1"), row("K리그2"), row("K1리그"), row(None, "K2리그"),
-                row("WK리그"), row("J1리그", "J1리그"), row("한국FA컵"), row(None, "EFL챔"),
-                row("잉글랜드 프리미어리그", "EPL"), row("J2리그", "J2리그"), row("UEFA 챔피언스리그", "UCL"),
-                row("미국 메이저리그사커", "MLS")]
-        picked = bc.filter_rows(rows, bc.DEFAULT_LEAGUE)
-        self.assertEqual([r["leagueShortName"] or r["leagueName"] for r in picked],
-                         ["K리그1", "K리그2", "K1리그", "K2리그", "WK리그", "J1리그", "EFL챔", "EPL", "MLS"])
+    def test_default_takes_everything_and_slim_keeps_worker_keys(self):
+        rows = [{"itemCode": it, "leagueShortName": n, "domastic": d, "extra": 1}
+                for it, n, d in [("BS", "KBO", True), ("BS", "MLB", False), ("BK", "NBA", False),
+                                 ("VL", "이탈리아배구", False), ("SC", "EPL", False), ("SC", None, None)]]
+        self.assertEqual(bc.filter_rows(rows, bc.DEFAULT_LEAGUE), rows)
+        self.assertEqual(bc.slim(rows[1]), {"itemCode": "BS", "leagueShortName": "MLB", "domastic": False})
+        # 리그를 직접 고르면 그 리그만
+        self.assertEqual([r["leagueShortName"] for r in bc.filter_rows(rows, "^MLB$|^NBA$")], ["MLB", "NBA"])
+
+    def test_send_rows_chunks(self):
+        rows = [{"matchSeq": i} for i in range(650)]
+        with mock.patch.object(bc, "ingest", return_value="ok") as ing:
+            self.assertEqual(bc.send_rows("u", "t", 260114, rows), ["ok"] * 3)
+        self.assertEqual([len(c.args[2]["rows"]) for c in ing.call_args_list], [300, 300, 50])
 
     def test_candidate_rounds(self):
         with mock.patch.object(bc, "datetime") as dt:
@@ -148,6 +152,17 @@ class BackfillTest(unittest.TestCase):
         result, sent = self.run_step(fetch, state)
         self.assertEqual(result, "done")
         self.assertEqual(sent, [240001])
+
+    def test_stops_when_row_budget_reached(self):
+        # 픽스처 회차는 아시안게임 3행. 행 한도 5 면 2회차(6행) 보내고 멈춘다
+        state = {"year": 24, "no": 1, "empty": 0, "stop_at": 250001}
+        sent = []
+        with mock.patch.object(bc, "fetch_round", return_value=self.data):
+            result = bc.backfill_step(state, "아시안게임", lambda ts, rows: sent.append(ts), 20,
+                                      sleep=lambda s: None, max_rows=5)
+        self.assertEqual(result, "more")
+        self.assertEqual(sent, [240001, 240002])
+        self.assertEqual(state["no"], 3)
 
 
 

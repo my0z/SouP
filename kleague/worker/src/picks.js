@@ -44,16 +44,6 @@ function selections(b) {
 export class Model {
   constructor(entries = []) { this.stats = new Map(entries); }
   toJSON() { return [...this.stats]; }
-  add(b) {
-    const res = Number(b.result);
-    if (![0, 1, 2].includes(res) || (res === 1 && !(b.d > 1))) return;  // 승패 게임의 무승부 결과는 적특
-    for (const s of selections(b)) {
-      const st = this.stats.get(s.key) || { n: 0, hit: 0, exp: 0, ret: 0 };
-      st.n++; st.exp += s.p;
-      if (res === s.side) { st.hit++; st.ret += s.odd; }
-      this.stats.set(s.key, st);
-    }
-  }
   // 보정한 확률과 기대수익
   judge(s) {
     const st = this.stats.get(s.key) || { n: 0, hit: 0, exp: 0, ret: 0 };
@@ -69,33 +59,63 @@ export class Model {
   }
 }
 
-export function buildModel(history) {
+// ---------- D1 에서 묶음별로 미리 집계한 행으로 계산 ----------
+// 과거 행을 Worker 로 다 가져오면 읽기 한도와 CPU 한도를 넘으므로 SQL 이 (시즌 · 게임 유형 · 쪽 · 배당 구간) 별로 더해서 준다.
+
+const bucketSql = (col) =>
+  `CASE ${ODDS_EDGES.map((e, i) => `WHEN ${col} < ${e} THEN ${i}`).join(" ")} ELSE ${ODDS_EDGES.length} END`;
+
+// where: proto_matches m 에 거는 조건 (예: 국내만)
+export const aggSql = (where) => `
+  WITH f AS (
+    SELECT m.bet_name, strftime('%Y', m.game_ts + 32400, 'unixepoch') AS season, CAST(m.result AS INTEGER) AS r,
+      o.win AS w, CASE WHEN o.draw > 1 THEN o.draw END AS d, o.lose AS l
+    FROM proto_matches m
+    JOIN proto_odds o ON o.id = (SELECT MAX(id) FROM proto_odds WHERE gm_ts = m.gm_ts AND match_seq = m.match_seq)
+    WHERE m.status IN ('4', '20') AND m.result IN ('0', '1', '2') AND m.bet_name IS NOT NULL
+      AND m.bet_name NOT LIKE '%전반%' AND o.win > 1 AND o.lose > 1 AND ${where}),
+  g AS (SELECT *, 1.0 / w + COALESCE(1.0 / d, 0) + 1.0 / l AS s FROM f WHERE NOT (r = 1 AND d IS NULL)),
+  sel AS (
+    SELECT season, bet_name, 0 AS side, w AS odd, 1.0 / w / s AS p, r = 0 AS won FROM g
+    UNION ALL SELECT season, bet_name, 1, d, 1.0 / d / s, r = 1 FROM g WHERE d IS NOT NULL
+    UNION ALL SELECT season, bet_name, 2, l, 1.0 / l / s, r = 2 FROM g)
+  SELECT season, bet_name, side, ${bucketSql("odd")} AS bucket, COUNT(*) AS n, SUM(won) AS hit, SUM(p) AS exp,
+    SUM(CASE WHEN won THEN odd ELSE 0 END) AS ret, SUM(odd) AS sodd
+  FROM sel GROUP BY season, bet_name, side, bucket`;
+
+const aggKey = (a) => {
+  const [sport, kind] = split(a.bet_name);
+  return `${sport}|${kind}|${a.side}|${a.bucket}`;
+};
+const addStat = (map, key, a) => {
+  const st = map.get(key) || { n: 0, hit: 0, exp: 0, ret: 0 };
+  st.n += a.n; st.hit += a.hit; st.exp += a.exp; st.ret += a.ret;
+  map.set(key, st);
+};
+
+export function modelFromAgg(agg) {
   const m = new Model();
-  for (const b of history) m.add(b);
+  for (const a of agg) addStat(m.stats, aggKey(a), a);
   return m;
 }
 
-// 시간 순서대로 지나가며 그때까지의 데이터만으로 추천했다면 어땠는지 (10만원씩)
-export function backtest(history) {
-  const rows = [...history].sort((a, b) => a.game_ts - b.game_ts);
-  const m = new Model();
-  const out = { n: 0, hit: 0, ret: 0, bySport: {} };
-  let i = 0;
-  while (i < rows.length) {
-    // 같은 시각 경기끼리는 서로의 결과를 모르게 한 번에 판단한다
-    let j = i;
-    while (j < rows.length && rows[j].game_ts === rows[i].game_ts) j++;
-    const batch = rows.slice(i, j);
-    for (const b of batch) {
-      for (const pk of m.picks(b)) {
-        const won = Number(b.result) === pk.side;
-        const sport = split(b.bet_name)[0];
-        const s = (out.bySport[sport] ||= { n: 0, hit: 0, ret: 0 });
-        for (const acc of [out, s]) { acc.n++; acc.hit += won ? 1 : 0; acc.ret += won ? pk.odd : 0; }
+// 시즌 단위로 앞으로 가며 검증: 그 시즌 전까지의 묶음 통계로 추천 묶음을 정하고 그 시즌 결과를 더한다.
+// (묶음 안 평균 배당과 평균 확률로 판단하는 근사)
+export function backtestAgg(agg) {
+  const seasons = [...new Set(agg.map((a) => a.season))].sort();
+  const past = new Model();
+  const out = { n: 0, hit: 0, ret: 0, bySport: {}, bySeason: {} };
+  for (const season of seasons) {
+    const rows = agg.filter((a) => a.season === season);
+    for (const a of rows) {
+      const j = past.judge({ key: aggKey(a), odd: a.sodd / a.n, p: a.exp / a.n });
+      if (j.n < MIN_N || j.ev < MIN_EV) continue;
+      const sport = split(a.bet_name)[0];
+      for (const acc of [out, (out.bySport[sport] ||= { n: 0, hit: 0, ret: 0 }), (out.bySeason[season] ||= { n: 0, hit: 0, ret: 0 })]) {
+        acc.n += a.n; acc.hit += a.hit; acc.ret += a.ret;
       }
     }
-    for (const b of batch) m.add(b);
-    i = j;
+    for (const a of rows) addStat(past.stats, aggKey(a), a);
   }
   return out;
 }
