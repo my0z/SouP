@@ -92,7 +92,7 @@ export async function loadGames(db, { from, to }) {
   const { results } = await db
     .prepare(
       `WITH r AS (
-         SELECT gm_ts, match_seq, win, draw, lose,
+         SELECT gm_ts, match_seq, win, draw, lose, handi, fetched_at,
            ROW_NUMBER() OVER (PARTITION BY gm_ts, match_seq ORDER BY id DESC) AS rn_last,
            ROW_NUMBER() OVER (PARTITION BY gm_ts, match_seq ORDER BY id ASC) AS rn_first
          FROM proto_odds WHERE (gm_ts, match_seq) IN
@@ -103,9 +103,12 @@ export async function loadGames(db, { from, to }) {
            MAX(CASE WHEN rn_last = 1 THEN lose END) AS l,
            MAX(CASE WHEN rn_first = 1 THEN win END) AS w0, MAX(CASE WHEN rn_first = 1 THEN draw END) AS d0,
            MAX(CASE WHEN rn_first = 1 THEN lose END) AS l0,
+           MAX(CASE WHEN rn_last = 2 THEN win END) AS w1, MAX(CASE WHEN rn_last = 2 THEN draw END) AS d1,
+           MAX(CASE WHEN rn_last = 2 THEN lose END) AS l1, MAX(CASE WHEN rn_last = 2 THEN handi END) AS h1,
+           MAX(CASE WHEN rn_last = 1 THEN fetched_at END) AS last_at,
            COUNT(*) AS changes
          FROM r GROUP BY gm_ts, match_seq)
-       SELECT m.*, o.w, o.d, o.l, o.w0, o.d0, o.l0, o.changes
+       SELECT m.*, o.w, o.d, o.l, o.w0, o.d0, o.l0, o.w1, o.d1, o.l1, o.h1, o.last_at, o.changes
        FROM proto_matches m LEFT JOIN o USING (gm_ts, match_seq)
        WHERE m.game_ts BETWEEN ?1 AND ?2
        ORDER BY m.game_ts, m.match_seq`
@@ -123,6 +126,31 @@ async function pageData(db) {
   };
 }
 
+// ---------- 배당 변경 ----------
+
+const RECENT_SEC = 24 * 3600;
+const agoSec = (iso) => (iso ? Math.floor(Date.now() / 1000) - Math.floor(Date.parse(iso) / 1000) : Infinity);
+const ago = (sec) => (sec < 3600 ? `${Math.max(1, Math.floor(sec / 60))}분 전` : sec < DAY ? `${Math.floor(sec / 3600)}시간 전` : `${Math.floor(sec / DAY)}일 전`);
+
+// 게임 유형 하나의 상태: 최근 24시간 안에 바뀜(changed) / 처음 발표됨(fresh) / 없음
+export function betChange(b) {
+  const sec = agoSec(b.last_at);
+  if (sec > RECENT_SEC || !b.last_at) return null;
+  if ((b.changes || 0) <= 1) return { kind: "fresh", sec };
+  return { kind: "changed", sec };
+}
+
+function recentChanges(games) {
+  const out = [];
+  for (const g of games) {
+    for (const b of g.bets) {
+      const c = betChange(b);
+      if (c && c.kind === "changed") out.push({ g, b, sec: c.sec });
+    }
+  }
+  return out.sort((a, b) => a.sec - b.sec);
+}
+
 // ---------- HTML ----------
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -132,24 +160,34 @@ const kst = (ts) =>
     hour: "2-digit", minute: "2-digit", hour12: false,
   }).format(new Date(ts * 1000));
 
-function cell(label, v, v0, hit) {
+function cell(label, v, v0, v1, hit, recent) {
   if (!v) return `<td class="na">-</td>`;
   const diff = v0 && v !== v0 ? v - v0 : 0;
   const move = diff
     ? `<small class="${diff < 0 ? "down" : "up"}">${diff < 0 ? "▼" : "▲"}${Math.abs(diff).toFixed(2)}</small>`
     : "";
-  return `<td class="${hit ? "hit" : ""}"><span class="lbl">${esc(label)}</span>${v.toFixed(2)}${move}</td>`;
+  // 직전 수집값과 달라졌고 24시간 안의 변경이면 칸을 강조하고 이전 값을 보여 준다
+  const flip = recent && v1 && v1 !== v;
+  const prev = flip ? `<s class="prev">${v1.toFixed(2)}</s>` : "";
+  const cls = [hit ? "hit" : "", flip ? "flip" : ""].join(" ").trim();
+  return `<td class="${cls}"><span class="lbl">${esc(label)}</span>${prev}${v.toFixed(2)}${move}</td>`;
 }
 
 function betRow(b) {
   const name = String(b.bet_name || "").replace(/^축구\s*/, "");
   const ou = /언더오버/.test(name);
-  const handi = b.handi ? `<span class="h">${ou ? "기준 " : b.handi > 0 ? "+" : ""}${b.handi}</span>` : "";
+  const c = isFinished(b) ? null : betChange(b);
+  const recent = c && c.kind === "changed";
+  const lineMoved = recent && b.h1 != null && b.h1 !== b.handi;
+  const handi = b.handi
+    ? `<span class="h">${ou ? "기준 " : b.handi > 0 ? "+" : ""}${lineMoved ? `<s>${b.h1}</s>→` : ""}${b.handi}</span>`
+    : "";
+  const badge = c ? `<span class="badge ${c.kind}">${c.kind === "fresh" ? "새 배당" : "변경"} ${ago(c.sec)}</span>` : "";
   const hit = RESULT_IDX[b.result];
-  return `<tr><th>${esc(name)}${handi}</th>
-    ${cell(b.win_txt || "승", b.w, b.w0, hit === 0)}
-    ${cell(b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.d, b.d0, hit === 1)}
-    ${cell(b.lose_txt || "패", b.l, b.l0, hit === 2)}</tr>`;
+  return `<tr class="${recent ? "moved" : ""}"><th>${esc(name)}${handi}${badge}</th>
+    ${cell(b.win_txt || "승", b.w, b.w0, b.w1, hit === 0, recent)}
+    ${cell(b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.d, b.d0, b.d1, hit === 1, recent)}
+    ${cell(b.lose_txt || "패", b.l, b.l0, b.l1, hit === 2, recent)}</tr>`;
 }
 
 function probBar(g) {
@@ -164,8 +202,12 @@ function probBar(g) {
 }
 
 function gameCard(g) {
-  return `<article>
-    <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>
+  const changed = g.score ? [] : g.bets.map(betChange).filter((c) => c && c.kind === "changed");
+  const flag = changed.length
+    ? `<span class="badge changed">배당 변경 ${changed.length}건 · ${ago(Math.min(...changed.map((c) => c.sec)))}</span>`
+    : "";
+  return `<article class="${changed.length ? "has-change" : ""}">
+    <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>${flag}
       ${g.score ? `<b class="score">${esc(g.score)}</b>` : ""}</header>
     <h2>${esc(g.home)} <span class="muted">vs</span> ${esc(g.away)}</h2>
     ${g.score ? "" : probBar(g)}
@@ -173,13 +215,29 @@ function gameCard(g) {
   </article>`;
 }
 
+function changeList(upcoming) {
+  const list = recentChanges(upcoming);
+  if (!list.length) return "";
+  const pick = (b, now, prev) => (prev && prev !== now ? `${prev.toFixed(2)}→<b>${now.toFixed(2)}</b>` : null);
+  const rows = list.slice(0, 12).map(({ g, b, sec }) => {
+    const name = String(b.bet_name || "").replace(/^축구\s*/, "");
+    const parts = [
+      [b.win_txt || "승", pick(b, b.w, b.w1)],
+      [b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", pick(b, b.d, b.d1)],
+      [b.lose_txt || "패", pick(b, b.l, b.l1)],
+    ].filter(([, t]) => t).map(([l, t]) => `${esc(l)} ${t}`).join(" · ");
+    return `<li><span class="muted">${ago(sec)}</span> ${esc(g.home)} vs ${esc(g.away)} <span class="muted">${esc(name)}</span> ${parts}</li>`;
+  }).join("");
+  return `<section class="changes"><h2>최근 24시간 배당 변경</h2><ul>${rows}</ul></section>`;
+}
+
 function page({ upcoming, recent }) {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>K리그 프로토 배당</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--fg:#14161a;--muted:#6b7280;--line:#e5e7eb;--home:#2563eb;--draw:#9ca3af;--away:#dc2626;--up:#dc2626;--down:#2563eb;--hit:#dcfce7}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--muted:#9097a3;--line:#2a2e36;--home:#3b82f6;--draw:#6b7280;--away:#ef4444;--up:#f87171;--down:#60a5fa;--hit:#14532d}}
+:root{--chg:#fef3c7;--chg-fg:#b45309;--bg:#f6f7f9;--card:#fff;--fg:#14161a;--muted:#6b7280;--line:#e5e7eb;--home:#2563eb;--draw:#9ca3af;--away:#dc2626;--up:#dc2626;--down:#2563eb;--hit:#dcfce7}
+@media (prefers-color-scheme:dark){:root{--chg:#422006;--chg-fg:#f59e0b;--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--muted:#9097a3;--line:#2a2e36;--home:#3b82f6;--draw:#6b7280;--away:#ef4444;--up:#f87171;--down:#60a5fa;--hit:#14532d}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif}
 main{max-width:760px;margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 4px}
 h2{font-size:17px;margin:6px 0 10px}h3{font-size:16px;margin:28px 0 4px}.muted{color:var(--muted)}.small{font-size:12px;margin:-6px 0 8px}
@@ -193,12 +251,19 @@ article header{display:flex;gap:8px;align-items:center;font-size:13px;color:var(
 .scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th,td{padding:6px 8px;border-top:1px solid var(--line);text-align:right;white-space:nowrap}
 th{text-align:left;font-weight:500}td.hit{background:var(--hit);font-weight:700}td.na{color:var(--muted)}
-.lbl{color:var(--muted);font-size:12px;margin-right:4px}.h{margin-left:6px;color:var(--muted);font-size:12px}
+.lbl{color:var(--muted);font-size:12px;margin-right:4px}
+.badge{display:inline-block;margin-left:6px;padding:0 6px;border-radius:6px;font-size:11px;font-weight:700;vertical-align:1px}
+.badge.changed{background:var(--chg);color:var(--chg-fg)}.badge.fresh{background:var(--line);color:var(--fg)}
+article.has-change{border-color:var(--chg-fg);box-shadow:0 0 0 1px var(--chg-fg) inset}
+td.flip{background:var(--chg)}s.prev{color:var(--muted);font-size:11px;margin-right:4px}
+.changes ul{list-style:none;padding:0;margin:0}.changes li{padding:6px 0;border-top:1px solid var(--line);font-size:14px}.changes li:first-child{border-top:0}.h{margin-left:6px;color:var(--muted);font-size:12px}
 small{margin-left:4px;font-size:11px}.up{color:var(--up)}.down{color:var(--down)}
-@media (max-width:480px){th,td{padding:6px 4px}.lbl{display:block;margin:0}small{display:block;margin:0}}
+article header{flex-wrap:wrap}.tag{white-space:nowrap}
+@media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
 </style></head><body><main>
 <h1>K리그 프로토 배당</h1>
-<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동</p>
+<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당</p>
+${changeList(upcoming)}
 ${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 K리그 프로토 경기가 없거나 아직 수집 전입니다</section>`}
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 </main></body></html>`;
