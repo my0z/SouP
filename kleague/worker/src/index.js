@@ -5,6 +5,7 @@
 //   GET  /api/upcoming : 같은 데이터를 JSON 으로
 //   GET  /export.csv   : 저장된 경기와 배당 CSV (분석용. gm_from gm_to league 로 나눠 받기)
 //   GET  /api/rounds   : 회차별 리그별 경기 수
+//   GET  /api/accuracy : K리그 배당 예상과 실제 결과 비교
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -132,7 +133,58 @@ async function pageData(db) {
   return {
     upcoming: games.filter((g) => g.game_ts >= now - 3 * 3600 && !g.score),
     recent: games.filter((g) => g.score).reverse(),
+    accuracy: await accuracyData(db),
   };
+}
+
+// ---------- 예상과 결과 ----------
+// 배당이 가장 낮은 쪽(정배)이 배당의 예상이다. 마진을 뺀 확률이 예상 적중률이고 실제 결과와 비교한다.
+
+export function favoriteOf(w, d, l) {
+  const odds = [w, d, l];
+  const inv = odds.map((x) => 1 / x);
+  const sum = inv[0] + inv[1] + inv[2];
+  const fav = odds.indexOf(Math.min(...odds));
+  const dog = w >= l ? 0 : 2;  // 홈과 원정 중 배당이 높은 쪽
+  return { fav, dog, probs: inv.map((x) => x / sum) };
+}
+
+const BUCKETS = [[0, 1.5, "1.5 미만"], [1.5, 2.0, "1.5~2.0"], [2.0, 2.5, "2.0~2.5"], [2.5, 99, "2.5 이상"]];
+
+// rows: {season, w, d, l, result("0"|"1"|"2")}
+export function accuracy(rows) {
+  const blank = () => ({ n: 0, exp: 0, hit: 0, ret: 0 });
+  const total = blank(), draw = blank(), dog = blank();
+  const buckets = BUCKETS.map(([lo, hi, label]) => ({ lo, hi, label, ...blank() }));
+  const seasons = {};
+  const add = (acc, p, won, odd) => { acc.n++; acc.exp += p; acc.hit += won ? 1 : 0; acc.ret += won ? odd : 0; };
+  for (const r of rows) {
+    const odds = [r.w, r.d, r.l];
+    if (!odds.every((x) => x > 1)) continue;
+    const res = Number(r.result);
+    const f = favoriteOf(r.w, r.d, r.l);
+    const favOdd = odds[f.fav];
+    add(total, f.probs[f.fav], res === f.fav, favOdd);
+    add(buckets.find((b) => favOdd >= b.lo && favOdd < b.hi), f.probs[f.fav], res === f.fav, favOdd);
+    add((seasons[r.season] ||= blank()), f.probs[f.fav], res === f.fav, favOdd);
+    add(draw, f.probs[1], res === 1, r.d);
+    add(dog, f.probs[f.dog], res === f.dog, odds[f.dog]);
+  }
+  return { total, buckets: buckets.filter((b) => b.n), draw, dog,
+           seasons: Object.entries(seasons).sort().map(([season, acc]) => ({ season, ...acc })) };
+}
+
+async function accuracyData(db) {
+  const { results } = await db
+    .prepare(
+      `SELECT m.game_ts, m.result, o.win AS w, o.draw AS d, o.lose AS l
+       FROM proto_matches m
+       JOIN proto_odds o ON o.id = (SELECT MAX(id) FROM proto_odds WHERE gm_ts = m.gm_ts AND match_seq = m.match_seq)
+       WHERE m.bet_name = '축구 승무패' AND m.status IN ('4', '20') AND m.result IN ('0', '1', '2')
+         AND (m.league LIKE 'K리그%' OR m.league LIKE 'K1%' OR m.league LIKE 'K2%')`
+    )
+    .all();
+  return accuracy(results.map((r) => ({ ...r, season: new Date((r.game_ts + 9 * 3600) * 1000).getUTCFullYear() })));
 }
 
 // ---------- 배당 변경 ----------
@@ -225,6 +277,15 @@ export function gameLinks(g) {
   };
 }
 
+function verdict(g) {
+  const main = g.bets.find((b) => isMain(b) && b.w && b.d && b.l);
+  if (!g.score || !main || !["0", "1", "2"].includes(String(main.result))) return "";
+  const { fav } = favoriteOf(main.w, main.d, main.l);
+  const res = Number(main.result);
+  if (res === fav) return `<span class="badge hit">정배 적중</span>`;
+  return `<span class="badge miss">${res === 1 ? "무승부" : "이변"} · 정배 ${["홈승", "무", "원정승"][fav]} 실패</span>`;
+}
+
 function gameCard(g) {
   const changed = g.score ? [] : g.bets.map(betChange).filter((c) => c && c.kind === "changed");
   const flag = changed.length
@@ -232,7 +293,7 @@ function gameCard(g) {
     : "";
   const link = gameLinks(g);
   return `<article id="${esc(link.id)}" class="${changed.length ? "has-change" : ""}">
-    <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>${flag}
+    <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>${flag}${verdict(g)}
       ${g.score ? `<b class="score">${esc(g.score)}</b>` : ""}</header>
     <h2><a href="${esc(link.betman)}" target="_blank" rel="noopener">${esc(g.home)} <span class="muted">vs</span> ${esc(g.away)}</a></h2>
     <nav class="links"><a href="${esc(link.betman)}" target="_blank" rel="noopener">${g.score ? "베트맨 결과" : "베트맨 구매"} ↗</a>
@@ -258,7 +319,35 @@ function changeList(upcoming) {
   return `<section class="changes"><h2>최근 24시간 배당 변경</h2><ul>${rows}</ul></section>`;
 }
 
-function page({ upcoming, recent }) {
+const pc = (x) => `${(x * 100).toFixed(1)}%`;
+function accRow(label, a) {
+  const actual = a.hit / a.n, expected = a.exp / a.n, roi = a.ret / a.n - 1;
+  const gap = actual - expected;
+  return `<tr><th>${esc(label)}</th><td>${a.n}</td><td>${pc(expected)}</td><td><b>${pc(actual)}</b></td>
+    <td class="${gap >= 0 ? "up" : "down"}">${gap >= 0 ? "+" : ""}${(gap * 100).toFixed(1)}</td>
+    <td class="${roi >= 0 ? "up" : "down"}">${roi >= 0 ? "+" : ""}${pc(roi)}</td></tr>`;
+}
+
+function accuracySection(acc) {
+  if (!acc || !acc.total.n) return "";
+  const head = `<thead><tr><th></th><th>경기</th><th>예상</th><th>실제</th><th>차이</th><th>수익률</th></tr></thead>`;
+  return `<h3 id="accuracy">배당 예상 vs 실제 결과</h3>
+  <section>
+    <p class="muted small">K리그 승무패 마감 배당 기준 · 예상은 마진을 뺀 배당 확률 · 수익률은 매번 같은 금액을 걸었을 때</p>
+    <div class="scroll"><table class="acc">${head}<tbody>
+      ${accRow("정배 (배당 최저)", acc.total)}
+      ${accRow("무승부", acc.draw)}
+      ${accRow("역배 (홈·원정 중 높은 쪽)", acc.dog)}
+    </tbody></table></div>
+    <h4>정배 배당 구간별</h4>
+    <div class="scroll"><table class="acc">${head}<tbody>${acc.buckets.map((b) => accRow(b.label, b)).join("")}</tbody></table></div>
+    <h4>시즌별 정배</h4>
+    <div class="scroll"><table class="acc">${head}<tbody>${acc.seasons.map((x) => accRow(`${x.season}년`, x)).join("")}</tbody></table></div>
+    <p class="muted small">차이가 + 면 배당이 예상한 것보다 실제로 더 자주 맞았다는 뜻입니다. 수익률은 마진 약 15% 때문에 대부분 마이너스입니다.</p>
+  </section>`;
+}
+
+function page({ upcoming, recent, accuracy }) {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>K리그 프로토 배당</title>
@@ -284,6 +373,8 @@ h2 a{color:inherit;text-decoration:none}h2 a:hover{text-decoration:underline}
 .links{display:flex;gap:12px;margin:-4px 0 10px;font-size:13px}.links a,.changes a{color:var(--home);text-decoration:none}
 .links a:hover,.changes a:hover{text-decoration:underline}article{scroll-margin-top:12px}
 .no{display:inline-block;min-width:34px;margin-right:6px;font-size:12px;font-weight:700;color:var(--muted);font-variant-numeric:tabular-nums}
+.badge.hit{background:var(--hit);color:var(--fg)}.badge.miss{background:#fee2e2;color:#991b1b}
+h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:13px}
 .badge.single{background:var(--hit);color:var(--fg)}
 .badge.changed{background:var(--chg);color:var(--chg-fg)}.badge.fresh{background:var(--line);color:var(--fg)}
 article.has-change{border-color:var(--chg-fg);box-shadow:0 0 0 1px var(--chg-fg) inset}
@@ -294,10 +385,11 @@ article header{flex-wrap:wrap}.tag{white-space:nowrap}
 @media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
 </style></head><body><main>
 <h1>K리그 프로토 배당</h1>
-<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능</p>
+<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <a href="#accuracy">예상 적중률 보기</a></p>
 ${changeList(upcoming)}
 ${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 K리그 프로토 경기가 없거나 아직 수집 전입니다</section>`}
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
+${accuracySection(accuracy)}
 </main></body></html>`;
 }
 
@@ -350,6 +442,7 @@ export default {
       return Response.json({ ok: true, rows: body.rows.length });
     }
     if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB));
+    if (url.pathname === "/api/accuracy") return Response.json(await accuracyData(env.DB));
     if (url.pathname === "/export.csv") return exportCsv(env.DB, url);
     if (url.pathname === "/api/rounds") {
       // 저장된 회차별 경기 수. 내보내기를 나눠 받을 때 쓴다
