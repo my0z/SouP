@@ -47,3 +47,12 @@ CREATE TABLE IF NOT EXISTS alert_log (
     value        TEXT NOT NULL,
     sent_at      INTEGER NOT NULL
 );
+
+-- 보낼 알림 큐 (Claude 루틴이 카카오톡 나에게 보내기로 보낸다)
+CREATE TABLE IF NOT EXISTS alert_queue (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    text         TEXT NOT NULL,
+    url          TEXT,
+    created_at   INTEGER NOT NULL,
+    delivered_at INTEGER
+);

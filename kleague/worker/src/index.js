@@ -8,7 +8,7 @@
 //   GET  /api/accuracy : 국내 경기 배당 예상과 실제 결과 비교 (?sport=야구)
 //   POST /notify       : K리그 카카오톡 알림 (src/alerts.js)
 
-import { runAlerts, kakaoLogin, kakaoCallback } from "./alerts.js";
+import { runAlerts, kakaoLogin, kakaoCallback, alertsPending, alertsAck } from "./alerts.js";
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -528,6 +528,8 @@ export default {
         return Response.json({ ok: false, reason: String(e.message || e) }, { status: 502 });
       }
     }
+    if (url.pathname === "/alerts/pending") return alertsPending(env, url);
+    if (url.pathname === "/alerts/ack" && req.method === "POST") return alertsAck(env, url, req);
     if (url.pathname === "/kakao/login") return kakaoLogin(env, url);
     if (url.pathname === "/kakao/callback") return kakaoCallback(env, url);
     const sport = SPORTS.includes(url.searchParams.get("sport")) ? url.searchParams.get("sport") : "";

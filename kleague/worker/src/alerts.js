@@ -2,7 +2,9 @@
 //   GET  /kakao/login?key=INGEST_TOKEN : 카카오 로그인으로 알림 받을 계정 연결 (처음 한 번)
 //   GET  /kakao/callback               : 카카오가 돌려보내는 주소. 토큰을 저장하고 시험 메시지를 보낸다
 //   POST /notify                       : 수집기가 매 실행 끝에 부른다. 새 배당 / 큰 변동 / 경기 직전 / 결과 알림
-// 필요한 비밀값: KAKAO_REST_KEY (카카오 앱 REST API 키), 선택 KAKAO_CLIENT_SECRET
+//   GET  /alerts/pending?key=..        : 아직 안 보낸 알림 (Claude 루틴이 카카오톡으로 보낸다)
+//   POST /alerts/ack?key=..            : {"ids":[...]} 보낸 알림 표시
+// 카카오 앱을 직접 연결할 때만: KAKAO_REST_KEY (카카오 앱 REST API 키), 선택 KAKAO_CLIENT_SECRET
 
 import {
   loadGames, isKLeague, mainOf, favoriteOf, kst, gameLinks, stripSport, won,
@@ -178,27 +180,60 @@ export function buildAlerts(games, sent, now = Math.floor(Date.now() / 1000)) {
   return out.sort((a, b) => a.order - b.order);
 }
 
+// 카카오 앱을 연결했으면 바로 보내고 아니면 큐에 쌓는다.
+// 큐는 Claude 루틴이 /alerts/pending 으로 읽어 PlayMCP 카카오톡 나에게 보내기로 보낸 뒤 /alerts/ack 로 지운다.
 export async function runAlerts(env) {
-  const token = await accessToken(env);
-  if (!token) return { ok: false, reason: "카카오 미연결 (/kakao/login?key=... 로 연결)" };
+  const token = await accessToken(env).catch(() => null);
   const now = Math.floor(Date.now() / 1000);
   const games = (await loadGames(env.DB, { from: now - 3 * DAY, to: now + 14 * DAY })).filter((g) => isKLeague(g.league));
   const { results } = await env.DB.prepare("SELECT key, value FROM alert_log WHERE sent_at > ?").bind(now - 30 * DAY).all();
   const sent = Object.fromEntries(results.map((r) => [r.key, JSON.parse(r.value)]));
   const alerts = buildAlerts(games, sent, now);
-  let count = 0;
-  for (const a of alerts.slice(0, MAX_PER_RUN)) {
-    await sendMemo(token, a.text, a.url);
-    count++;
-    const put = env.DB.prepare(
-      "INSERT INTO alert_log (key, value, sent_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, sent_at = excluded.sent_at");
-    const stmts = [];
+  const todo = token ? alerts.slice(0, MAX_PER_RUN) : alerts;
+  const put = env.DB.prepare(
+    "INSERT INTO alert_log (key, value, sent_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, sent_at = excluded.sent_at");
+  const enqueue = env.DB.prepare("INSERT INTO alert_queue (text, url, created_at) VALUES (?, ?, ?)");
+  for (const a of todo) {
+    if (token) await sendMemo(token, a.text, a.url);
+    const stmts = token ? [] : [enqueue.bind(a.text.slice(0, 200), a.url, now)];
     if (a.log !== false) stmts.push(put.bind(a.key, JSON.stringify(a.value), now));
     // 변동 비교 기준은 마지막으로 알린 배당
     if (a.odds) stmts.push(put.bind(`odds:${a.odds.id}`, JSON.stringify(a.odds.odds), now));
     await env.DB.batch(stmts);
   }
   // 오래된 기록 정리
-  await env.DB.prepare("DELETE FROM alert_log WHERE sent_at < ?").bind(now - 60 * DAY).run();
-  return { ok: true, sent: count, waiting: Math.max(0, alerts.length - count) };
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM alert_log WHERE sent_at < ?").bind(now - 60 * DAY),
+    env.DB.prepare("DELETE FROM alert_queue WHERE created_at < ?").bind(now - 7 * DAY),
+  ]);
+  return { ok: true, mode: token ? "kakao" : "queue", [token ? "sent" : "queued"]: todo.length,
+           waiting: alerts.length - todo.length };
+}
+
+// ---------- 큐 (Claude 루틴용) ----------
+// 열쇠는 D1 kv 의 alert_key 에 둔다 (INGEST_TOKEN 과 따로라 새어도 알림 읽기와 지우기만 된다)
+const QUEUE_TTL = 12 * HOUR;  // 12시간 넘게 못 보낸 알림은 늦었으니 버린다
+
+async function queueAuth(env, url) {
+  const key = await kvGet(env.DB, "alert_key");
+  return !!key && url.searchParams.get("key") === key;
+}
+
+export async function alertsPending(env, url) {
+  if (!(await queueAuth(env, url))) return new Response("forbidden", { status: 403 });
+  const now = Math.floor(Date.now() / 1000);
+  const { results } = await env.DB
+    .prepare("SELECT id, text, url, created_at FROM alert_queue WHERE delivered_at IS NULL AND created_at > ? ORDER BY id LIMIT 20")
+    .bind(now - QUEUE_TTL).all();
+  return Response.json(results);
+}
+
+export async function alertsAck(env, url, req) {
+  if (!(await queueAuth(env, url))) return new Response("forbidden", { status: 403 });
+  const { ids } = await req.json().catch(() => ({}));
+  if (!Array.isArray(ids) || !ids.every(Number.isInteger)) return new Response("bad request", { status: 400 });
+  const now = Math.floor(Date.now() / 1000);
+  const stmt = env.DB.prepare("UPDATE alert_queue SET delivered_at = ? WHERE id = ?");
+  if (ids.length) await env.DB.batch(ids.map((id) => stmt.bind(now, id)));
+  return Response.json({ ok: true, acked: ids.length });
 }

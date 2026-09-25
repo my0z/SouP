@@ -99,15 +99,12 @@ https://kl.usb.kr/api/rounds                                  # 회차별 리그
 - **경기 3시간 전**: 마지막 배당과 정배 확률과 핸디캡 언더오버 요약
 - **결과**: 점수와 정배 적중 여부와 정배에 10만원 걸었을 때 손익
 
-설정 (처음 한 번)
-1. https://developers.kakao.com 에서 앱을 만들고 **REST API 키**를 복사합니다
-2. 플랫폼 Web 사이트 도메인에 `https://kl.usb.kr` 를 넣습니다
-3. 카카오 로그인을 켜고 Redirect URI 에 `https://kl.usb.kr/kakao/callback` 을 넣습니다
-4. 동의항목에서 **카카오톡 메시지 전송** 을 켭니다
-5. `npx wrangler secret put KAKAO_REST_KEY` 로 키를 넣습니다. 보안의 Client Secret 을 쓰면 `KAKAO_CLIENT_SECRET` 도 넣습니다
-6. 브라우저에서 `https://kl.usb.kr/kakao/login?key=INGEST_TOKEN값` 을 열어 로그인하면 시험 메시지가 옵니다
+보내는 방법
+- 수집기가 `/notify` 를 부르면 Worker 가 알림을 만들어 큐(`alert_queue`)에 쌓습니다
+- Claude 루틴이 매시간(09~23시) `/alerts/pending` 을 읽어 PlayMCP **카카오톡 나에게 보내기**로 보내고 `/alerts/ack` 로 지웁니다
+- 큐 열쇠는 D1 `kv` 표의 `alert_key` 입니다. 12시간 넘게 못 보낸 알림은 버립니다
 
-토큰은 알아서 갱신됩니다. 두 달 넘게 알림이 한 번도 돌지 않으면 6번을 다시 합니다.
+카카오 앱을 직접 만들어 연결하면(`KAKAO_REST_KEY` 비밀값과 `/kakao/login?key=INGEST_TOKEN값`) 루틴 없이 30분마다 바로 보냅니다.
 
 ## 저장 방식
 - `proto_matches`: 경기의 게임 유형(승무패 핸디캡 언더오버 등) 하나당 한 행. 상태와 결과와 점수가 갱신됩니다
