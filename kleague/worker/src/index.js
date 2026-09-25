@@ -277,13 +277,23 @@ export function gameLinks(g) {
   };
 }
 
+// 경기마다 거는 금액 (예상 vs 결과 손익 계산용)
+const STAKE = 100000;
+const comma = (n) => String(Math.abs(Math.round(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+const man = (x) => {
+  const [int, dec] = (Math.abs(x) / 10000).toFixed(1).split(".");
+  return `${x >= 0 ? "+" : "-"}${comma(int)}.${dec}만`;
+};
+const won = (x) => `${x >= 0 ? "+" : "-"}${comma(x)}원`;
+
 function verdict(g) {
   const main = g.bets.find((b) => isMain(b) && b.w && b.d && b.l);
   if (!g.score || !main || !["0", "1", "2"].includes(String(main.result))) return "";
   const { fav } = favoriteOf(main.w, main.d, main.l);
   const res = Number(main.result);
-  if (res === fav) return `<span class="badge hit">정배 적중</span>`;
-  return `<span class="badge miss">${res === 1 ? "무승부" : "이변"} · 정배 ${["홈승", "무", "원정승"][fav]} 실패</span>`;
+  const odd = [main.w, main.d, main.l][fav];
+  if (res === fav) return `<span class="badge hit">정배 적중 · 10만원 → ${won((odd - 1) * STAKE)}</span>`;
+  return `<span class="badge miss">${res === 1 ? "무승부" : "이변"} · 정배 ${["홈승", "무", "원정승"][fav]} 실패 · 10만원 → ${won(-STAKE)}</span>`;
 }
 
 function gameCard(g) {
@@ -325,19 +335,20 @@ function accRow(label, a) {
   const gap = actual - expected;
   return `<tr><th>${esc(label)}</th><td>${a.n}</td><td>${pc(expected)}</td><td><b>${pc(actual)}</b></td>
     <td class="${gap >= 0 ? "up" : "down"}">${gap >= 0 ? "+" : ""}${(gap * 100).toFixed(1)}</td>
-    <td class="${roi >= 0 ? "up" : "down"}">${roi >= 0 ? "+" : ""}${pc(roi)}</td></tr>`;
+    <td class="${roi >= 0 ? "up" : "down"}">${roi >= 0 ? "+" : ""}${pc(roi)}</td>
+    <td class="${roi >= 0 ? "up" : "down"}">${man((a.ret - a.n) * STAKE)}</td></tr>`;
 }
 
 function accuracySection(acc) {
   if (!acc || !acc.total.n) return "";
-  const head = `<thead><tr><th></th><th>경기</th><th>예상</th><th>실제</th><th>차이</th><th>수익률</th></tr></thead>`;
+  const head = `<thead><tr><th></th><th>경기</th><th>예상</th><th>실제</th><th>차이</th><th>수익률</th><th>손익</th></tr></thead>`;
   return `<h3 id="accuracy">배당 예상 vs 실제 결과</h3>
   <section>
-    <p class="muted small">K리그 승무패 마감 배당 기준 · 예상은 마진을 뺀 배당 확률 · 수익률은 매번 같은 금액을 걸었을 때</p>
+    <p class="muted small">K리그 승무패 마감 배당 기준 · 정배는 배당이 가장 낮은 쪽 · 역배는 홈승과 원정승 중 배당이 높은 쪽 · 예상은 마진을 뺀 배당 확률 · 수익률은 매번 같은 금액을 걸었을 때 · 손익은 경기마다 10만원을 걸었을 때 총 손익 (만원)</p>
     <div class="scroll"><table class="acc">${head}<tbody>
-      ${accRow("정배 (배당 최저)", acc.total)}
+      ${accRow("정배", acc.total)}
       ${accRow("무승부", acc.draw)}
-      ${accRow("역배 (홈·원정 중 높은 쪽)", acc.dog)}
+      ${accRow("역배", acc.dog)}
     </tbody></table></div>
     <h4>정배 배당 구간별</h4>
     <div class="scroll"><table class="acc">${head}<tbody>${acc.buckets.map((b) => accRow(b.label, b)).join("")}</tbody></table></div>
@@ -374,7 +385,7 @@ h2 a{color:inherit;text-decoration:none}h2 a:hover{text-decoration:underline}
 .links a:hover,.changes a:hover{text-decoration:underline}article{scroll-margin-top:12px}
 .no{display:inline-block;min-width:34px;margin-right:6px;font-size:12px;font-weight:700;color:var(--muted);font-variant-numeric:tabular-nums}
 .badge.hit{background:var(--hit);color:var(--fg)}.badge.miss{background:#fee2e2;color:#991b1b}
-h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:13px}
+h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:12px;white-space:nowrap;padding:6px 4px}
 .badge.single{background:var(--hit);color:var(--fg)}
 .badge.changed{background:var(--chg);color:var(--chg-fg)}.badge.fresh{background:var(--line);color:var(--fg)}
 article.has-change{border-color:var(--chg-fg);box-shadow:0 0 0 1px var(--chg-fg) inset}
