@@ -7,8 +7,10 @@
 //   GET  /api/rounds   : 회차별 리그별 경기 수
 //   GET  /api/accuracy : 국내 경기 배당 예상과 실제 결과 비교 (?sport=야구)
 //   POST /notify       : K리그 카카오톡 알림 (src/alerts.js)
+//   GET  /api/picks    : 베팅 추천 근거 (과거 검증 결과와 후했던 배당 구간. src/picks.js)
 
 import { runAlerts, kakaoLogin, kakaoCallback, alertsPending, alertsAck } from "./alerts.js";
+import { Model, buildModel, backtest, goodBuckets, MIN_EV, MIN_N } from "./picks.js";
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -163,8 +165,19 @@ async function pageData(db, sport = "", ctx) {
   const all = (await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY })).filter(isDomestic);
   const counts = Object.fromEntries(SPORTS.map((s) => [s, all.filter((g) => g.sport === s && !g.score).length]));
   const games = sport ? all.filter((g) => g.sport === sport) : all;
+  const pk = await picksCached(db, ctx);
+  const model = new Model(pk.model);
+  const picks = [];
+  for (const g of games) {
+    if (g.score || g.game_ts < now) continue;
+    for (const b of g.bets) {
+      b.picks = model.picks(b);
+      for (const p of b.picks) picks.push({ g, b, p });
+    }
+  }
+  picks.sort((a, b) => b.p.ev - a.p.ev);
   return {
-    sport, counts,
+    sport, counts, picks, backtest: pk.backtest,
     upcoming: games.filter((g) => g.game_ts >= now - 3 * 3600 && !g.score),
     recent: games.filter((g) => g.score).reverse().slice(0, 40),
     accuracy: await accuracyCached(db, sport, ctx),
@@ -228,6 +241,35 @@ async function accuracyData(db, sport = "") {
     .map((r) => ({ ...r, season: new Date((r.game_ts + 9 * 3600) * 1000).getUTCFullYear() })));
 }
 
+// 추천용 과거 데이터: 끝난 게임 유형 전부와 마감 배당
+async function picksData(db) {
+  const { results } = await db
+    .prepare(
+      `SELECT m.game_ts, m.bet_name, m.result, o.win AS w, o.draw AS d, o.lose AS l
+       FROM proto_matches m
+       JOIN proto_odds o ON o.id = (SELECT MAX(id) FROM proto_odds WHERE gm_ts = m.gm_ts AND match_seq = m.match_seq)
+       WHERE m.status IN ('4', '20') AND m.result IN ('0', '1', '2') AND m.bet_name IS NOT NULL`
+    )
+    .all();
+  const model = buildModel(results);
+  return { model: model.toJSON(), backtest: backtest(results), good: goodBuckets(model), rows: results.length };
+}
+
+async function picksCached(db, ctx) {
+  return cached(`picks`, () => picksData(db), ctx);
+}
+
+async function cached(name, make, ctx) {
+  if (typeof caches === "undefined") return make();
+  const key = new Request(`https://kl.usb.kr/__cache/${name}`);
+  const hit = await caches.default.match(key);
+  if (hit) return hit.json();
+  const data = await make();
+  const put = caches.default.put(key, Response.json(data, { headers: { "cache-control": "public, max-age=3600" } }));
+  if (ctx) ctx.waitUntil(put); else await put;
+  return data;
+}
+
 // 적중률은 끝난 경기 전체를 읽으므로 1시간 캐시한다 (D1 무료 읽기 한도 절약)
 async function accuracyCached(db, sport, ctx) {
   if (typeof caches === "undefined") return accuracyData(db, sport);
@@ -274,7 +316,7 @@ export const kst = (ts) =>
     hour: "2-digit", minute: "2-digit", hour12: false,
   }).format(new Date(ts * 1000));
 
-function cell(label, v, v0, v1, hit, recent) {
+function cell(label, v, v0, v1, hit, recent, pick) {
   if (!v) return `<td class="na">-</td>`;
   const diff = v0 && v !== v0 ? v - v0 : 0;
   const move = diff
@@ -283,11 +325,38 @@ function cell(label, v, v0, v1, hit, recent) {
   // 직전 수집값과 달라졌고 24시간 안의 변경이면 칸을 강조하고 이전 값을 보여 준다
   const flip = recent && v1 && v1 !== v;
   const prev = flip ? `<s class="prev">${v1.toFixed(2)}</s>` : "";
-  const cls = [hit ? "hit" : "", flip ? "flip" : ""].join(" ").trim();
-  return `<td class="${cls}"><span class="lbl">${esc(label)}</span>${prev}${v.toFixed(2)}${move}</td>`;
+  const cls = [hit ? "hit" : "", flip ? "flip" : "", pick ? "pick" : ""].join(" ").trim();
+  const tag = pick ? `<em class="ptag">추천 +${(pick.ev * 100).toFixed(0)}%</em>` : "";
+  return `<td class="${cls}">${tag}<span class="lbl">${esc(label)}</span>${prev}${v.toFixed(2)}${move}</td>`;
 }
 
 export const stripSport = (name) => String(name || "").replace(/^(축구|야구|농구|배구)\s*/, "");
+
+const pickOf = (b, side) => (b.picks || []).find((p) => p.side === side);
+const sideName = (b, side) =>
+  [b.win_txt || "승", b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.lose_txt || "패"][side];
+
+// 추천 목록과 과거 검증 결과
+function picksSection(picks, bt) {
+  const roi = bt && bt.n ? bt.ret / bt.n - 1 : null;
+  const verdict = roi == null
+    ? `아직 과거 검증할 데이터가 부족합니다.`
+    : `과거 검증: 같은 방법으로 ${bt.n}번 추천했다면 적중 ${pc(bt.hit / bt.n)} · 수익률 <b class="${roi >= 0 ? "up" : "down"}">${roi >= 0 ? "+" : ""}${pc(roi)}</b> · 10만원씩 ${won((bt.ret - bt.n) * STAKE)}`;
+  const warn = roi == null || roi < 0
+    ? `<p class="warn">⚠️ 과거 검증에서 아직 손해입니다. 데이터가 쌓여 검증 수익률이 + 가 되기 전까지는 참고만 하세요.</p>`
+    : "";
+  const rows = picks.slice(0, 15).map(({ g, b, p }) => {
+    const single = String(b.sgl) === "1" ? `<span class="badge single">단폴</span>` : "";
+    const hd = b.handi ? ` ${/언더오버/.test(b.bet_name) ? "" : b.handi > 0 ? "+" : ""}${b.handi}` : "";
+    return `<li><a href="#${esc(gameLinks(g).id)}">${esc(g.home)} vs ${esc(g.away)}</a> <span class="muted">${kst(g.game_ts)}</span><br>
+      <span class="no">${esc(b.match_seq)}</span>${esc(stripSport(b.bet_name))}${esc(hd)} <b>${esc(sideName(b, p.side))} ${p.odd.toFixed(2)}</b>${single}
+      <span class="muted small2">기대수익 <b class="up">+${(p.ev * 100).toFixed(1)}%</b> · 비슷한 과거 ${p.n}번 적중 ${pc(p.pastHit)}</span></li>`;
+  }).join("");
+  return `<section class="picks"><h2>추천 베팅</h2>
+    <p class="muted small">비슷한 배당이 과거에 실제로 더 자주 맞은 선택만 고릅니다 (기대수익 ${MIN_EV * 100}% 이상 · 과거 ${MIN_N}번 이상)</p>
+    <p class="small">${verdict}</p>${warn}
+    ${rows ? `<ul>${rows}</ul>` : `<p class="muted">지금 조건에 맞는 추천이 없습니다</p>`}</section>`;
+}
 
 function betRow(b) {
   const name = stripSport(b.bet_name);
@@ -304,9 +373,9 @@ function betRow(b) {
   const no = `<span class="no">${esc(b.match_seq)}</span>`;
   const single = String(b.sgl) === "1" ? `<span class="badge single">단폴</span>` : "";
   return `<tr class="${recent ? "moved" : ""}"><th>${no}${esc(name)}${handi}${single}${badge}</th>
-    ${cell(b.win_txt || "승", b.w, b.w0, b.w1, hit === 0, recent)}
-    ${cell(b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.d, b.d0, b.d1, hit === 1, recent)}
-    ${cell(b.lose_txt || "패", b.l, b.l0, b.l1, hit === 2, recent)}</tr>`;
+    ${cell(b.win_txt || "승", b.w, b.w0, b.w1, hit === 0, recent, pickOf(b, 0))}
+    ${cell(b.draw_txt && b.draw_txt !== "-" ? b.draw_txt : "무", b.d, b.d0, b.d1, hit === 1, recent, pickOf(b, 1))}
+    ${cell(b.lose_txt || "패", b.l, b.l0, b.l1, hit === 2, recent, pickOf(b, 2))}</tr>`;
 }
 
 function probBar(g) {
@@ -422,13 +491,13 @@ function tabs(sport, counts) {
   return `<nav class="tabs">${link("", "전체")}${SPORTS.map((s) => link(s, `${s} <small>${counts[s] || 0}</small>`)).join("")}</nav>`;
 }
 
-function page({ sport, counts, upcoming, recent, accuracy }) {
+function page({ sport, counts, upcoming, recent, accuracy, picks, backtest }) {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>국내 프로토 배당</title>
 <style>
-:root{--chg:#fef3c7;--chg-fg:#b45309;--bg:#f6f7f9;--card:#fff;--fg:#14161a;--muted:#6b7280;--line:#e5e7eb;--home:#2563eb;--draw:#9ca3af;--away:#dc2626;--up:#dc2626;--down:#2563eb;--hit:#dcfce7}
-@media (prefers-color-scheme:dark){:root{--chg:#422006;--chg-fg:#f59e0b;--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--muted:#9097a3;--line:#2a2e36;--home:#3b82f6;--draw:#6b7280;--away:#ef4444;--up:#f87171;--down:#60a5fa;--hit:#14532d}}
+:root{--pick:#7c3aed;--pick-bg:#f5f3ff;--chg:#fef3c7;--chg-fg:#b45309;--bg:#f6f7f9;--card:#fff;--fg:#14161a;--muted:#6b7280;--line:#e5e7eb;--home:#2563eb;--draw:#9ca3af;--away:#dc2626;--up:#dc2626;--down:#2563eb;--hit:#dcfce7}
+@media (prefers-color-scheme:dark){:root{--pick:#a78bfa;--pick-bg:#2e1065;--chg:#422006;--chg-fg:#f59e0b;--bg:#0f1115;--card:#181b21;--fg:#e6e8eb;--muted:#9097a3;--line:#2a2e36;--home:#3b82f6;--draw:#6b7280;--away:#ef4444;--up:#f87171;--down:#60a5fa;--hit:#14532d}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif}
 main{max-width:760px;margin:0 auto;padding:24px 16px}h1{font-size:22px;margin:0 0 4px}
 h2{font-size:17px;margin:6px 0 10px}h3{font-size:16px;margin:28px 0 4px}.muted{color:var(--muted)}.small{font-size:12px;margin:-6px 0 8px}
@@ -451,6 +520,9 @@ h2 a{color:inherit;text-decoration:none}h2 a:hover{text-decoration:underline}
 .badge.hit{background:var(--hit);color:var(--fg)}.badge.miss{background:#fee2e2;color:#991b1b}
 h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:12px;white-space:nowrap;padding:6px 4px}
 .badge.single{background:var(--hit);color:var(--fg)}
+td.pick{box-shadow:0 0 0 2px var(--pick) inset;background:var(--pick-bg)}.ptag{display:block;font-style:normal;font-size:10px;font-weight:700;color:var(--pick)}
+.picks{border-color:var(--pick)}.picks ul{list-style:none;padding:0;margin:0}.picks li{padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+.picks a{color:var(--home);text-decoration:none}.small2{display:block;font-size:12px}.warn{font-size:13px;background:var(--chg);color:var(--chg-fg);padding:6px 10px;border-radius:8px}
 .tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.tabs a{padding:4px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--fg);text-decoration:none;font-size:14px}
 .tabs a.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}.tabs small{margin-left:2px;color:inherit;opacity:.7;display:inline}
 .badge.changed{background:var(--chg);color:var(--chg-fg)}.badge.fresh{background:var(--line);color:var(--fg)}
@@ -464,6 +536,7 @@ article header{flex-wrap:wrap}.tag{white-space:nowrap}
 <h1>국내 프로토 배당</h1>
 <p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <a href="#accuracy">예상 적중률 보기</a></p>
 ${tabs(sport, counts)}
+${picksSection(picks, backtest)}
 ${changeList(upcoming)}
 ${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 ${esc(sport || "국내")} 프로토 경기가 없거나 아직 수집 전입니다</section>`}
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
@@ -534,6 +607,10 @@ export default {
     if (url.pathname === "/kakao/callback") return kakaoCallback(env, url);
     const sport = SPORTS.includes(url.searchParams.get("sport")) ? url.searchParams.get("sport") : "";
     if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB, sport, ctx));
+    if (url.pathname === "/api/picks") {
+      const { backtest: bt, good, rows } = await picksCached(env.DB, ctx);
+      return Response.json({ rows, backtest: bt, good, min_ev: MIN_EV, min_n: MIN_N });
+    }
     if (url.pathname === "/api/accuracy") return Response.json(await accuracyCached(env.DB, sport, ctx));
     if (url.pathname === "/export.csv") return exportCsv(env.DB, url);
     if (url.pathname === "/api/rounds") {
