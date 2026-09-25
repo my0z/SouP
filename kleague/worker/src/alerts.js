@@ -15,7 +15,8 @@ const DAY = 86400;
 const SITE = "https://kl.usb.kr";
 const REDIRECT = `${SITE}/kakao/callback`;
 const MOVE_MIN = 0.1;       // 승무패 배당이 이만큼 바뀌면 알린다
-const PRE_SEC = 3 * HOUR;   // 경기 시작 3시간 전 요약
+// 경기 전 요약: 수집 PC 가 21~05시에만 켜져 있어서 낮 경기는 전날 밤 마지막 배당으로 요약한다
+const PRE_SEC = 18 * HOUR;
 const MAX_PER_RUN = 8;      // 한 번에 보내는 최대 메시지 (나머지는 다음 실행에)
 const PREFIX = "[K리그]";
 const STAKE = 100000;     // 결과 알림의 손익 기준 금액
@@ -104,7 +105,7 @@ export async function kakaoCallback(env, url) {
   await kvPut(env.DB, "kakao_state", { state: null, at: 0 });
   try {
     const tokens = await saveTokens(env.DB, await tokenRequest(env, { grant_type: "authorization_code", redirect_uri: REDIRECT, code }));
-    await sendMemo(tokens.access_token, `${PREFIX} 알림 연결 완료\n새 배당 · 큰 변동 · 경기 3시간 전 · 결과를 보내 드립니다`);
+    await sendMemo(tokens.access_token, `${PREFIX} 알림 연결 완료\n새 배당 · 큰 변동 · 경기 전 요약 · 결과를 보내 드립니다`);
   } catch (e) {
     return html(`연결 실패: ${String(e.message).replace(/</g, "&lt;")}`, 500);
   }
@@ -173,7 +174,7 @@ export function buildAlerts(games, sent, now = Math.floor(Date.now() / 1000)) {
     if (!sent[`pre:${id}`] && g.game_ts - now <= PRE_SEC) {
       const { fav, probs } = favoriteOf(m.w, m.d, m.l);
       out.push({ key: `pre:${id}`, value: 1, order: 2, url: link, odds: { id, odds },
-        text: [`${PREFIX} 경기 3시간 전`, title(g), `${when} · 번호 ${m.match_seq}${single}`, oddsLine(m),
+        text: [`${PREFIX} 경기 전 요약`, title(g), `${when} · 번호 ${m.match_seq}${single}`, oddsLine(m),
                `정배 ${pickName[fav]} ${Math.round(probs[fav] * 100)}%`, ...extraLines(g)].join("\n") });
     }
   }
