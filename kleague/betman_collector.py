@@ -8,7 +8,7 @@
     python3 betman_collector.py              # 최근 회차 자동 탐색 후 전송
     python3 betman_collector.py --dry-run    # 전송 없이 결과만 출력
     python3 betman_collector.py --gmts 260113 --league "아시안게임"   # 특정 회차와 리그로 시험
-    python3 betman_collector.py --backfill 2022                       # 2022년부터 과거 회차 50개씩 이어받기
+    python3 betman_collector.py --backfill 2021                       # 2021년부터 과거 회차 25개씩 이어받기
 """
 import argparse
 import datetime
@@ -86,8 +86,10 @@ def rows_of(data):
     return [dict(zip(keys, row)) for row in datas]
 
 
-# 최근 회차는 "K리그1" 이고 과거 회차는 "K1리그" 처럼 짧게 온다. 여자 WK리그는 뺀다.
-DEFAULT_LEAGUE = r"(?<!W)K\s?[12]?\s?리그"
+# K리그: 최근 회차는 "K리그1" 이고 짧게 "K1리그" 로 올 수도 있다. 여자 WK리그는 뺀다.
+# 해외: toto 모델에 있는 리그의 베트맨 짧은 이름 (leagueShortName 과 정확히 일치)
+OVERSEAS_LEAGUES = ["EPL", "EFL챔", "라리가", "세리에A", "분데스리", "프리그1", "에레디비", "J1리그", "MLS"]
+DEFAULT_LEAGUE = r"(?<!W)K\s?[12]?\s?리그|^(?:" + "|".join(map(re.escape, OVERSEAS_LEAGUES)) + r")$"
 
 
 def filter_rows(rows, league_pattern):
@@ -227,12 +229,12 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="베트맨 프로토 승부식 K리그 배당 수집기")
     p.add_argument("--gmts", type=int, help="특정 회차만 수집 (예: 260113)")
     p.add_argument("--league", default=os.environ.get("LEAGUE_PATTERN", DEFAULT_LEAGUE),
-                   help="리그 이름 정규식 (기본값: K리그1 K리그2 K1리그 K2리그)")
+                   help="리그 이름 정규식 (기본값: K리그와 toto 해외 리그 9개)")
     p.add_argument("--dry-run", action="store_true", help="Worker로 보내지 않고 출력만")
     p.add_argument("--no-jitter", action="store_true", help="시작 전 무작위 대기 생략")
     p.add_argument("--backfill", type=int, metavar="YEAR",
                    help="YEAR년 1회차부터 과거 회차를 이어서 수집 (예: 2022). 실행할 때마다 --rounds 개씩")
-    p.add_argument("--rounds", type=int, default=50, help="--backfill 한 번에 볼 회차 수 (기본 50)")
+    p.add_argument("--rounds", type=int, default=25, help="--backfill 한 번에 볼 회차 수 (기본 25. Cloudflare 무료 쓰기 한도 때문)")
     args = p.parse_args(argv)
 
     state = load_state()

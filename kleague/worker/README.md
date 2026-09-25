@@ -48,18 +48,23 @@ Windows는 `kleague/run_betman.bat` 에 토큰을 넣고 `install_task.bat` 을 
 ## 과거 회차 일괄 수집
 프로토는 마감된 회차도 최종 배당과 결과를 돌려줍니다. 2021년 1회차부터 지금까지를 천천히 받아 둡니다.
 ```bash
-python3 betman_collector.py --backfill 2021            # 한 번 실행에 50회차씩 이어받기
+python3 betman_collector.py --backfill 2021            # 한 번 실행에 25회차씩 이어받기
 python3 betman_collector.py --backfill 2021 --dry-run  # 전송 없이 확인
 ```
+- 한 번 실행에 25회차씩 받습니다. 해외 리그까지 받으면 Cloudflare 무료 쓰기 한도(하루 10만 행)에 가까워지기 때문입니다
 - 진행 위치는 `.betman_backfill.json` 에 저장되어 다음 실행이 이어서 합니다
 - 요청 사이 8~20초를 쉬고 빈 회차가 3번 이어지면 다음 해로 넘어갑니다
 - 접속이 3번 연속 실패하면 6시간 쉽니다
-- Windows는 `install_backfill.bat` 을 한 번 실행하면 8시간마다 50회차씩 받습니다. 토큰은 `run_betman.bat` 에서 읽습니다
+- Windows는 `install_backfill.bat` 을 한 번 실행하면 8시간마다 25회차씩 받습니다. 토큰은 `run_betman.bat` 에서 읽습니다
 - 과거 회차는 마감 배당만 남습니다. 배당 변동 이력은 실시간 수집분에만 있습니다
 
 ## 분석용 내보내기
+수집 대상은 K리그와 toto 모델의 해외 리그 9개(EPL EFL챔 라리가 세리에A 분데스리 프리그1 에레디비 J1리그 MLS)입니다. 화면에는 K리그만 보입니다.
 ```
-https://kl.usb.kr/export.csv
+https://kl.usb.kr/export.csv                                  # 최근 100회차 전체
+https://kl.usb.kr/export.csv?gm_from=210001&gm_to=210100      # 회차 범위 (한 번에 100회차)
+https://kl.usb.kr/export.csv?league=EPL,라리가                 # 리그 짧은 이름
+https://kl.usb.kr/api/rounds                                  # 회차별 리그별 경기 수
 ```
 게임 유형마다 첫 배당(w0 d0 l0)과 마지막 배당(w d l)과 결과와 점수가 한 줄씩 들어 있습니다. 엑셀에서 바로 열립니다.
 

@@ -3,7 +3,8 @@
 //   POST /ingest       : 수집기가 보낸 compSchedules 행 저장 (INGEST_TOKEN 필요)
 //   GET  /             : 다가오는 경기의 게임 유형별 배당과 첫 수집 대비 변동, 최근 결과
 //   GET  /api/upcoming : 같은 데이터를 JSON 으로
-//   GET  /export.csv   : 저장된 전체 경기와 배당 (분석용)
+//   GET  /export.csv   : 저장된 경기와 배당 CSV (분석용. gm_from gm_to league 로 나눠 받기)
+//   GET  /api/rounds   : 회차별 리그별 경기 수
 
 const DAY = 86400;
 const RESULT_IDX = { 0: 0, 1: 1, 2: 2 };
@@ -55,7 +56,7 @@ export function ingestStmts(db, gmTs, rows) {
     const r = normalizeRow(raw);
     const handi = r.winHandi ?? null;
     out.push(upsert.bind(
-      gmTs, r.matchSeq, r.leagueName ?? null, r.homeName ?? null, r.awayName ?? null,
+      gmTs, r.matchSeq, r.leagueShortName || r.leagueName || null, r.homeName ?? null, r.awayName ?? null,
       Math.floor(r.gameDate / 1000), r.betId ?? null, r.betNm ?? null, handi,
       r.winTxt ?? null, r.drawTxt ?? null, r.loseTxt ?? null, r.protoStatus ?? null,
       r.gameResult ?? null, r.mchScore ?? null, ts
@@ -88,7 +89,9 @@ function groupGames(rows) {
   return [...games.values()].sort((a, b) => a.game_ts - b.game_ts);
 }
 
-export async function loadGames(db, { from, to }) {
+// by: "game_ts" (경기 시각 범위) 또는 "gm_ts" (회차 범위)
+export async function loadGames(db, { from, to, by = "game_ts" }) {
+  const col = by === "gm_ts" ? "gm_ts" : "game_ts";
   const { results } = await db
     .prepare(
       `WITH r AS (
@@ -96,7 +99,7 @@ export async function loadGames(db, { from, to }) {
            ROW_NUMBER() OVER (PARTITION BY gm_ts, match_seq ORDER BY id DESC) AS rn_last,
            ROW_NUMBER() OVER (PARTITION BY gm_ts, match_seq ORDER BY id ASC) AS rn_first
          FROM proto_odds WHERE (gm_ts, match_seq) IN
-           (SELECT gm_ts, match_seq FROM proto_matches WHERE game_ts BETWEEN ?1 AND ?2)),
+           (SELECT gm_ts, match_seq FROM proto_matches WHERE ${col} BETWEEN ?1 AND ?2)),
        o AS (
          SELECT gm_ts, match_seq,
            MAX(CASE WHEN rn_last = 1 THEN win END) AS w, MAX(CASE WHEN rn_last = 1 THEN draw END) AS d,
@@ -110,16 +113,19 @@ export async function loadGames(db, { from, to }) {
          FROM r GROUP BY gm_ts, match_seq)
        SELECT m.*, o.w, o.d, o.l, o.w0, o.d0, o.l0, o.w1, o.d1, o.l1, o.h1, o.last_at, o.changes
        FROM proto_matches m LEFT JOIN o USING (gm_ts, match_seq)
-       WHERE m.game_ts BETWEEN ?1 AND ?2
+       WHERE m.${col} BETWEEN ?1 AND ?2
        ORDER BY m.game_ts, m.match_seq`
     )
     .bind(from, to).all();
   return groupGames(results);
 }
 
+export const isKLeague = (name) => /^K\s?[12]?\s?리그/.test(name || "");
+
 async function pageData(db) {
   const now = Math.floor(Date.now() / 1000);
-  const games = await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY });
+  // 해외 리그도 저장하지만 이 화면은 K리그만 보여 준다
+  const games = (await loadGames(db, { from: now - 3 * DAY, to: now + 14 * DAY })).filter((g) => isKLeague(g.league));
   return {
     upcoming: games.filter((g) => g.game_ts >= now - 3 * 3600 && !g.score),
     recent: games.filter((g) => g.score).reverse(),
@@ -269,9 +275,19 @@ ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 </main></body></html>`;
 }
 
-// 분석용 전체 내보내기: 게임 유형별 첫 배당과 마지막 배당과 결과
-async function exportCsv(db) {
-  const games = await loadGames(db, { from: 0, to: 4102444800 });
+// 분석용 내보내기: 게임 유형별 첫 배당과 마지막 배당과 결과
+//   ?gm_from=210001&gm_to=210050  회차 범위 (한 번에 100회차까지. 없으면 최근 100회차)
+//   ?league=EPL                   리그 짧은 이름 (여러 개는 쉼표)
+async function exportCsv(db, url) {
+  const p = url.searchParams;
+  let gmTo = parseInt(p.get("gm_to")) || 0;
+  let gmFrom = parseInt(p.get("gm_from")) || 0;
+  if (!gmTo) gmTo = (await db.prepare("SELECT MAX(gm_ts) AS m FROM proto_matches").first())?.m || 0;
+  if (!gmFrom || gmTo - gmFrom > 100 * 10000) gmFrom = gmTo - 99;  // 회차 번호가 해를 넘어가도 과하게 읽지 않도록
+  if (gmTo - gmFrom >= 100 && Math.floor(gmTo / 10000) === Math.floor(gmFrom / 10000)) gmFrom = gmTo - 99;
+  const leagues = (p.get("league") || "").split(",").map((x) => x.trim()).filter(Boolean);
+  let games = await loadGames(db, { from: gmFrom, to: gmTo, by: "gm_ts" });
+  if (leagues.length) games = games.filter((g) => leagues.includes(g.league));
   const cols = ["gm_ts", "kickoff_kst", "league", "home", "away", "bet_name", "handi",
     "win_txt", "draw_txt", "lose_txt", "w0", "d0", "l0", "w", "d", "l", "changes", "status", "result", "score"];
   const q = (v) => (v == null ? "" : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
@@ -308,7 +324,14 @@ export default {
       return Response.json({ ok: true, rows: body.rows.length });
     }
     if (url.pathname === "/api/upcoming") return Response.json(await pageData(env.DB));
-    if (url.pathname === "/export.csv") return exportCsv(env.DB);
+    if (url.pathname === "/export.csv") return exportCsv(env.DB, url);
+    if (url.pathname === "/api/rounds") {
+      // 저장된 회차별 경기 수. 내보내기를 나눠 받을 때 쓴다
+      const { results } = await env.DB
+        .prepare("SELECT gm_ts, league, COUNT(DISTINCT game_ts || home || away) AS games FROM proto_matches GROUP BY gm_ts, league ORDER BY gm_ts")
+        .all();
+      return Response.json(results);
+    }
     if (url.pathname !== "/") return new Response("not found", { status: 404 });
     return new Response(page(await pageData(env.DB)), {
       headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=120" },

@@ -36,10 +36,12 @@ class BetmanTest(unittest.TestCase):
         def row(name, short=None):
             return {"itemCode": "SC", "leagueName": name, "leagueShortName": short}
         rows = [row("K리그1"), row("K리그2"), row("K1리그"), row(None, "K2리그"),
-                row("WK리그"), row("J1리그"), row("한국FA컵")]
+                row("WK리그"), row("J1리그", "J1리그"), row("한국FA컵"), row(None, "EFL챔"),
+                row("잉글랜드 프리미어리그", "EPL"), row("J2리그", "J2리그"), row("UEFA 챔피언스리그", "UCL"),
+                row("미국 메이저리그사커", "MLS")]
         picked = bc.filter_rows(rows, bc.DEFAULT_LEAGUE)
-        self.assertEqual([r["leagueName"] or r["leagueShortName"] for r in picked],
-                         ["K리그1", "K리그2", "K1리그", "K2리그"])
+        self.assertEqual([r["leagueShortName"] or r["leagueName"] for r in picked],
+                         ["K리그1", "K리그2", "K1리그", "K2리그", "J1리그", "EFL챔", "EPL", "MLS"])
 
     def test_candidate_rounds(self):
         with mock.patch.object(bc, "datetime") as dt:
