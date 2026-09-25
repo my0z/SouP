@@ -138,7 +138,7 @@ export function buildAlerts(games, sent, now = Math.floor(Date.now() / 1000)) {
     const m = mainOf(g);
     if (!m) continue;
     const id = `${m.gm_ts}-${m.match_seq}`;
-    const link = `${SITE}/?sport=${encodeURIComponent("축구")}#${gameLinks(g).id}`;
+    const link = `${SITE}/#${gameLinks(g).id}`;
     const when = kst(g.game_ts);
     const single = String(m.sgl) === "1" ? " 단폴" : "";
     const odds = { w: m.w, d: m.d, l: m.l };
@@ -182,6 +182,13 @@ export function buildAlerts(games, sent, now = Math.floor(Date.now() / 1000)) {
 
 // 카카오 앱을 연결했으면 바로 보내고 아니면 큐에 쌓는다.
 // 큐는 Claude 루틴이 /alerts/pending 으로 읽어 PlayMCP 카카오톡 나에게 보내기로 보낸 뒤 /alerts/ack 로 지운다.
+// 카카오톡 나에게 보내기(PlayMCP)는 글만 보내므로 끝에 링크를 붙인다. 200자를 넘으면 뒤쪽 줄부터 뺀다
+export function withLink(text, url, max = 200) {
+  const lines = text.split("\n");
+  while (lines.length > 1 && lines.join("\n").length + url.length + 1 > max) lines.pop();
+  return `${lines.join("\n").slice(0, max - url.length - 1)}\n${url}`;
+}
+
 export async function runAlerts(env) {
   const token = await accessToken(env).catch(() => null);
   const now = Math.floor(Date.now() / 1000);
@@ -195,7 +202,7 @@ export async function runAlerts(env) {
   const enqueue = env.DB.prepare("INSERT INTO alert_queue (text, url, created_at) VALUES (?, ?, ?)");
   for (const a of todo) {
     if (token) await sendMemo(token, a.text, a.url);
-    const stmts = token ? [] : [enqueue.bind(a.text.slice(0, 200), a.url, now)];
+    const stmts = token ? [] : [enqueue.bind(withLink(a.text, a.url), a.url, now)];
     if (a.log !== false) stmts.push(put.bind(a.key, JSON.stringify(a.value), now));
     // 변동 비교 기준은 마지막으로 알린 배당
     if (a.odds) stmts.push(put.bind(`odds:${a.odds.id}`, JSON.stringify(a.odds.odds), now));
