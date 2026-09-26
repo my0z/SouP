@@ -437,7 +437,7 @@ function picksSection(picks, bt) {
     const pick = sideName(b, p.side);
     const back = Math.round(p.odd * STAKE);
     return `<li class="ticket">
-      <div class="t-head"><span class="t-no">${circled(n)}</span><a href="#${esc(gameLinks(g).id)}">${esc(g.home)} vs ${esc(g.away)}</a>
+      <div class="t-head"><span class="t-no">${circled(n)}</span><a href="#${esc(gameLinks(g).id)}">${esc(g.home)} vs ${esc(g.away)}</a>${saleBadge(g)}
         <span class="muted">${kst(g.game_ts)} · ${esc(g.league)}</span></div>
       <div class="t-body">
         <div>경기 번호 <b class="big">${esc(b.match_seq)}</b> · ${esc(stripSport(b.bet_name))}${esc(hd)}</div>
@@ -525,6 +525,15 @@ function verdict(g) {
   return `<span class="badge miss">${res === 1 ? "무승부" : "이변"} · 정배 ${["홈승", "무", "원정승"][fav]} 실패 · 10만원 → ${won(-STAKE)}</span>`;
 }
 
+// 베트맨 프로토는 경기 시작 10분 전에 발매를 마감한다. 배당이 나왔으면 발매 중(상태 2), 아직 없으면 발매 전(상태 1)
+const CLOSE_BEFORE = 600;
+function saleBadge(g) {
+  if (g.score) return "";
+  const state = g.bets.some((b) => b.w) ? "open" : "before";
+  // 실제 문구와 남은 시간은 아래 스크립트가 지금 시각으로 채운다 (화면은 10분 캐시라서)
+  return `<span class="sale ${state}" data-close="${g.game_ts - CLOSE_BEFORE}" data-state="${state}">${state === "open" ? "구매 가능" : "발매 전"}</span>`;
+}
+
 function gameCard(g) {
   const changed = g.score ? [] : g.bets.map(betChange).filter((c) => c && c.kind === "changed");
   const flag = changed.length
@@ -532,7 +541,7 @@ function gameCard(g) {
     : "";
   const link = gameLinks(g);
   return `<article id="${esc(link.id)}" class="${changed.length ? "has-change" : ""}">
-    <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>${flag}${verdict(g)}
+    <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>${saleBadge(g)}${flag}${verdict(g)}
       ${g.score ? `<b class="score">${esc(g.score)}</b>` : ""}</header>
     ${g.score ? "" : `<div class="live-box" data-live-game="${esc(link.id)}" hidden></div>`}
     <h2><a href="${esc(link.betman)}" target="_blank" rel="noopener">${esc(g.home)} <span class="muted">vs</span> ${esc(g.away)}</a></h2>
@@ -706,6 +715,9 @@ td.flip{background:var(--chg)}s.prev{color:var(--muted);font-size:11px;margin-ri
 small{margin-left:4px;font-size:11px}.up{color:var(--up)}.down{color:var(--down)}
 article header{flex-wrap:wrap}.tag{white-space:nowrap}
 @media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
+.sale{display:inline-block;border-radius:6px;padding:0 8px;font-size:12px;font-weight:700;white-space:nowrap}
+.sale.open{background:var(--hit);color:var(--fg)}.sale.open.soon{background:var(--chg);color:var(--chg-fg)}
+.sale.before{background:var(--line);color:var(--muted)}.sale.closed{background:var(--line);color:var(--muted);text-decoration:line-through}
 .live-box{margin:4px 0 8px;font-size:14px}.live{display:inline-block;background:#dc2626;color:#fff;border-radius:6px;padding:2px 8px;font-weight:600}
 .live.off{background:var(--line);color:var(--fg)}.live-pick{margin-top:4px}
 .live-state{display:inline-block;border-radius:6px;padding:0 6px;font-weight:700;font-size:12px;background:var(--line)}
@@ -715,7 +727,7 @@ article header{flex-wrap:wrap}.tag{white-space:nowrap}
 .jump a:hover{opacity:1}html{scroll-behavior:smooth}
 </style></head><body><main id="top">
 <h1>국내 프로토 배당</h1>
-<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <a href="#accuracy">예상 적중률 보기</a> · <a href="#ledger">추천 결과 기록</a></p>
+<p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <span class="sale open">구매 가능</span> 은 지금 베트맨에서 살 수 있는 경기 (경기 10분 전 마감) · <a href="#accuracy">예상 적중률 보기</a> · <a href="#ledger">추천 결과 기록</a></p>
 ${tabs(sport, counts)}
 ${picksSection(picks, backtest)}
 ${changeList(upcoming)}
@@ -739,6 +751,21 @@ async function live() {
 }
 live();
 setInterval(live, 60000);
+// 구매 가능 / 마감까지 남은 시간 / 구매 마감
+function sale() {
+  const now = Date.now() / 1000;
+  document.querySelectorAll(".sale[data-close]").forEach((el) => {
+    const close = +el.dataset.close, left = close - now;
+    const hm = new Date((close + 9 * 3600) * 1000).toISOString().slice(11, 16);
+    if (left <= 0) { el.className = "sale closed"; el.textContent = "구매 마감"; return; }
+    if (el.dataset.state === "before") { el.textContent = "발매 전 · 배당 미발표"; return; }
+    const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60);
+    el.className = "sale open" + (left < 3600 ? " soon" : "");
+    el.textContent = "구매 가능 · " + hm + " 마감 (" + (h ? h + "시간 " : "") + m + "분 남음)";
+  });
+}
+sale();
+setInterval(sale, 30000);
 </script>
 <nav class="jump" aria-label="바로가기"><a href="#top" title="맨 위로" aria-label="맨 위로">▲</a><a href="#bottom" title="맨 아래로" aria-label="맨 아래로">▼</a></nav>
 </main></body></html>`;
