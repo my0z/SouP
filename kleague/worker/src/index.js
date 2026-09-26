@@ -703,7 +703,10 @@ td.flip{background:var(--chg)}s.prev{color:var(--muted);font-size:11px;margin-ri
 small{margin-left:4px;font-size:11px}.up{color:var(--up)}.down{color:var(--down)}
 article header{flex-wrap:wrap}.tag{white-space:nowrap}
 @media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
-</style></head><body><main>
+.jump{position:fixed;right:12px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:10}
+.jump a{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--fg);color:var(--bg);text-decoration:none;font-size:18px;box-shadow:0 2px 6px rgba(0,0,0,.25);opacity:.85}
+.jump a:hover{opacity:1}html{scroll-behavior:smooth}
+</style></head><body><main id="top">
 <h1>국내 프로토 배당</h1>
 <p class="muted">베트맨 프로토 승부식 기준 · ▲▼ 는 첫 수집 대비 변동 · <span class="badge changed">변경</span> 은 24시간 안에 바뀐 배당 · 앞 숫자는 베트맨 경기 번호 · <span class="badge single">단폴</span> 은 1경기 구매 가능 · <a href="#accuracy">예상 적중률 보기</a> · <a href="#ledger">추천 결과 기록</a></p>
 ${tabs(sport, counts)}
@@ -713,6 +716,8 @@ ${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">�
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 ${accuracySection(accuracy, sport)}
 ${ledgerSection(ledger)}
+<div id="bottom"></div>
+<nav class="jump" aria-label="바로가기"><a href="#top" title="맨 위로" aria-label="맨 위로">▲</a><a href="#bottom" title="맨 아래로" aria-label="맨 아래로">▼</a></nav>
 </main></body></html>`;
 }
 
