@@ -7,9 +7,11 @@
 //   GET  /api/rounds   : 회차별 리그별 경기 수
 //   GET  /api/accuracy : 국내 경기 배당 예상과 실제 결과 비교 (?sport=야구)
 //   POST /notify       : K리그 카카오톡 알림 (src/alerts.js)
+//   GET  /api/live     : 진행 중 경기 실시간 점수와 추천이 지금 맞고 있는지 (src/live.js. 화면이 1분마다 부른다)
 //   GET  /api/picks    : 베팅 추천 근거 (과거 검증 결과와 후했던 배당 구간. src/picks.js)
 
 import { runAlerts, kakaoLogin, kakaoCallback, alertsPending, alertsAck } from "./alerts.js";
+import { liveData } from "./live.js";
 import { Model, aggSql, modelFromAgg, backtestAgg, goodBuckets, MIN_EV, MIN_N } from "./picks.js";
 
 const DAY = 86400;
@@ -532,6 +534,7 @@ function gameCard(g) {
   return `<article id="${esc(link.id)}" class="${changed.length ? "has-change" : ""}">
     <header><span class="tag">${esc(g.league)}</span><time>${kst(g.game_ts)}</time>${flag}${verdict(g)}
       ${g.score ? `<b class="score">${esc(g.score)}</b>` : ""}</header>
+    ${g.score ? "" : `<div class="live-box" data-live-game="${esc(link.id)}" hidden></div>`}
     <h2><a href="${esc(link.betman)}" target="_blank" rel="noopener">${esc(g.home)} <span class="muted">vs</span> ${esc(g.away)}</a></h2>
     <nav class="links"><a href="${esc(link.betman)}" target="_blank" rel="noopener">${g.score ? "베트맨 결과" : "베트맨 구매"} ↗</a>
       <a href="${esc(link.info)}" target="_blank" rel="noopener">경기 정보 ↗</a></nav>
@@ -626,7 +629,7 @@ function ledgerSection(rows) {
     const b = { win_txt: r.win_txt, draw_txt: r.draw_txt, lose_txt: r.lose_txt };
     const hd = r.handi ? ` ${/언더오버/.test(r.bet_name) ? "" : r.handi > 0 ? "+" : ""}${r.handi}` : "";
     const res = r.voided ? `<span class="muted">적특</span>`
-      : r.won === null ? `<span class="muted">대기</span>`
+      : r.won === null ? `<span class="muted" data-live-pick="${r.gm_ts}|${r.match_seq}|${r.side}">대기</span>`
       : r.won ? `<span class="badge hit">적중 ${esc(r.score || "")}</span>` : `<span class="badge miss">실패 ${esc(r.score || "")}</span>`;
     const pl = r.won === null ? "" : won(r.won ? (r.odd - 1) * STAKE : -STAKE);
     const when = new Date((r.game_ts + 9 * 3600) * 1000).toISOString().slice(5, 16).replace("-", ".").replace("T", " ");
@@ -703,6 +706,10 @@ td.flip{background:var(--chg)}s.prev{color:var(--muted);font-size:11px;margin-ri
 small{margin-left:4px;font-size:11px}.up{color:var(--up)}.down{color:var(--down)}
 article header{flex-wrap:wrap}.tag{white-space:nowrap}
 @media (max-width:480px){th,td{padding:6px 4px}th{white-space:normal}th .badge{display:block;width:max-content;margin:2px 0 0}.h{margin-left:4px}.lbl{display:block;margin:0}small{display:block;margin:0}s.prev{display:block;margin:0}}
+.live-box{margin:4px 0 8px;font-size:14px}.live{display:inline-block;background:#dc2626;color:#fff;border-radius:6px;padding:2px 8px;font-weight:600}
+.live.off{background:var(--line);color:var(--fg)}.live-pick{margin-top:4px}
+.live-state{display:inline-block;border-radius:6px;padding:0 6px;font-weight:700;font-size:12px;background:var(--line)}
+.live-state.win{background:var(--hit);color:var(--fg)}.live-state.lose{background:#fee2e2;color:#991b1b}
 .jump{position:fixed;right:12px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:10}
 .jump a{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--fg);color:var(--bg);text-decoration:none;font-size:18px;box-shadow:0 2px 6px rgba(0,0,0,.25);opacity:.85}
 .jump a:hover{opacity:1}html{scroll-behavior:smooth}
@@ -717,6 +724,22 @@ ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 ${accuracySection(accuracy, sport)}
 ${ledgerSection(ledger)}
 <div id="bottom"></div>
+<script>
+// 진행 중인 경기 점수와 추천 상태를 1분마다 갱신한다
+async function live() {
+  try {
+    const d = await (await fetch("/api/live", { cache: "no-store" })).json();
+    for (const [id, v] of Object.entries(d.games || {})) {
+      document.querySelectorAll('[data-live-game="' + id + '"]').forEach((el) => { el.innerHTML = v.html; el.hidden = false; });
+    }
+    for (const [k, v] of Object.entries(d.picks || {})) {
+      document.querySelectorAll('[data-live-pick="' + k + '"]').forEach((el) => { el.innerHTML = v.html; });
+    }
+  } catch (e) {}
+}
+live();
+setInterval(live, 60000);
+</script>
 <nav class="jump" aria-label="바로가기"><a href="#top" title="맨 위로" aria-label="맨 위로">▲</a><a href="#bottom" title="맨 아래로" aria-label="맨 아래로">▼</a></nav>
 </main></body></html>`;
 }
@@ -756,6 +779,19 @@ async function exportCsv(db, url) {
 // 화면과 /api/upcoming 은 10분 캐시한다. 요청마다 D1 을 1만 행 넘게 읽어서 조회가 잦으면 읽기 한도를 넘는다.
 // 수집이 30분마다라 10분이면 충분히 새롭다.
 const PAGE_TTL = 600;
+// 실시간 점수는 1분 캐시
+async function liveCached(req, ctx, make) {
+  if (typeof caches === "undefined") return make();
+  const key = new Request("https://kl.usb.kr/__cache/live");
+  const hit = await caches.default.match(key);
+  if (hit) return hit;
+  const res = await make();
+  const out = new Response(res.body, res);
+  out.headers.set("cache-control", "public, max-age=60");
+  ctx.waitUntil(caches.default.put(key, out.clone()));
+  return out;
+}
+
 async function pageCached(req, ctx, make) {
   if (typeof caches === "undefined") return make();
   const key = new Request(req.url, { method: "GET" });
@@ -803,6 +839,15 @@ export default {
       // 기본은 해외 포함 전부. ?scope=domestic 이면 국내만. 경기마다 domestic(true/false) 와 sport 가 있다
       return pageCached(req, ctx, async () =>
         Response.json(await pageData(env.DB, { sport, ctx, domesticOnly: url.searchParams.get("scope") === "domestic" })));
+    }
+    if (url.pathname === "/api/live") {
+      return liveCached(req, ctx, async () => {
+        const games = (await recentGames(env.DB, ctx)).filter((g) => g.domestic);
+        const { results } = await env.DB.prepare(
+          "SELECT gm_ts, match_seq, side FROM pick_log WHERE active = 1 AND game_ts BETWEEN ? AND ?"
+        ).bind(Math.floor(Date.now() / 1000) - 6 * 3600, Math.floor(Date.now() / 1000)).all();
+        return Response.json(await liveData(games, results, sideName));
+      });
     }
     if (url.pathname === "/api/picks") {
       const { at, picks: { backtest: bt, good, rows } } = await getStats(env.DB, ctx);
