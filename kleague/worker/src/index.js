@@ -534,6 +534,13 @@ function saleBadge(g) {
   return `<span class="sale ${state}" data-close="${g.game_ts - CLOSE_BEFORE}" data-state="${state}">${state === "open" ? "구매 가능" : "발매 전"}</span>`;
 }
 
+// 목록 순서: 구매 가능 → 경기 중이거나 마감 → 발매 전. 같은 묶음 안에서는 경기 시각 순
+const saleRank = (g, now = Math.floor(Date.now() / 1000)) =>
+  g.game_ts - CLOSE_BEFORE <= now ? 1 : g.bets.some((b) => b.w) ? 0 : 2;
+function sortBySale(games) {
+  return games.map((g, i) => ({ g, i, r: saleRank(g) })).sort((a, b) => a.r - b.r || a.i - b.i).map((x) => x.g);
+}
+
 function gameCard(g) {
   const changed = g.score ? [] : g.bets.map(betChange).filter((c) => c && c.kind === "changed");
   const flag = changed.length
@@ -731,7 +738,7 @@ article header{flex-wrap:wrap}.tag{white-space:nowrap}
 ${tabs(sport, counts)}
 ${picksSection(picks, backtest)}
 ${changeList(upcoming)}
-${upcoming.length ? upcoming.map(gameCard).join("") : `<section class="muted">예정된 ${esc(sport || "국내")} 프로토 경기가 없거나 아직 수집 전입니다</section>`}
+${upcoming.length ? `<div id="games">${sortBySale(upcoming).map(gameCard).join("")}</div>` : `<section class="muted">예정된 ${esc(sport || "국내")} 프로토 경기가 없거나 아직 수집 전입니다</section>`}
 ${recent.length ? `<h3>최근 결과</h3>${recent.map(gameCard).join("")}` : ""}
 ${accuracySection(accuracy, sport)}
 ${ledgerSection(ledger)}
@@ -766,6 +773,15 @@ function sale() {
 }
 sale();
 setInterval(sale, 30000);
+// 화면은 10분 캐시라서 그사이 마감된 경기는 여기서 구매 가능 경기 아래로 옮긴다
+function reorder() {
+  const box = document.getElementById("games");
+  if (!box) return;
+  const rank = (el) => { const s = el.querySelector("header .sale"); return !s ? 1 : s.classList.contains("open") ? 0 : s.classList.contains("before") ? 2 : 1; };
+  [...box.children].map((el, i) => ({ el, i, r: rank(el) })).sort((a, b) => a.r - b.r || a.i - b.i).forEach((x) => box.appendChild(x.el));
+}
+reorder();
+setInterval(reorder, 30000);
 </script>
 <nav class="jump" aria-label="바로가기"><a href="#top" title="맨 위로" aria-label="맨 위로">▲</a><a href="#bottom" title="맨 아래로" aria-label="맨 아래로">▼</a></nav>
 </main></body></html>`;
