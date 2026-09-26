@@ -630,7 +630,11 @@ function ledgerSection(rows) {
       : r.won ? `<span class="badge hit">적중 ${esc(r.score || "")}</span>` : `<span class="badge miss">실패 ${esc(r.score || "")}</span>`;
     const pl = r.won === null ? "" : won(r.won ? (r.odd - 1) * STAKE : -STAKE);
     const when = new Date((r.game_ts + 9 * 3600) * 1000).toISOString().slice(5, 16).replace("-", ".").replace("T", " ");
-    return `<tr><td class="l">${esc(r.home)} vs ${esc(r.away)}<br><span class="muted">${when} · ${esc(r.league)} · ${esc(stripSport(r.bet_name))}${esc(hd)}</span></td>
+    // 두 팀 이름과 경기 날짜로 네이버 경기 결과를 찾는다
+    const d = new Date((r.game_ts + 9 * 3600) * 1000);
+    const q = `${r.home} ${r.away} ${d.getUTCFullYear()}년 ${d.getUTCMonth() + 1}월 ${d.getUTCDate()}일 경기결과`;
+    const result = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
+    return `<tr><td class="l"><a class="team" href="${esc(result)}" target="_blank" rel="noopener">${esc(r.home)} vs ${esc(r.away)} ↗</a><br><span class="muted">${when} · ${esc(r.league)} · ${esc(stripSport(r.bet_name))}${esc(hd)}</span></td>
       <td><b>${esc(sideName(b, r.side))}</b><br>${r.odd.toFixed(2)}</td>
       <td>${res}<br><span class="${r.won ? "up" : r.won === false ? "down" : ""}">${pl}</span></td></tr>`;
   };
@@ -681,7 +685,7 @@ h4{font-size:14px;margin:16px 0 4px}table.acc td,table.acc th{font-size:12px;whi
 .curve .line{fill:none;stroke:var(--pick);stroke-width:2;vector-effect:non-scaling-stroke}
 .curve .zero{stroke:var(--muted);stroke-dasharray:4 4;stroke-width:1;vector-effect:non-scaling-stroke}
 .curve .pt{fill:var(--pick);stroke:var(--card);stroke-width:2;vector-effect:non-scaling-stroke}
-table.ledger td,table.ledger th{font-size:13px;vertical-align:top}table.ledger td.l{text-align:left;white-space:normal}table.ledger .badge{margin:0}
+table.ledger td,table.ledger th{font-size:13px;vertical-align:top}table.ledger td.l{text-align:left;white-space:normal}table.ledger .badge{margin:0}table.ledger a.team{color:var(--home);text-decoration:none;font-weight:600}table.ledger a.team:hover{text-decoration:underline}
 td.pick{box-shadow:0 0 0 2px var(--pick) inset;background:var(--pick-bg)}.ptag{display:block;font-style:normal;font-size:10px;font-weight:700;color:var(--pick)}
 .picks{border:2px solid var(--pick)}.tickets{list-style:none;padding:0;margin:8px 0}
 .ticket{border:1px dashed var(--pick);border-radius:10px;padding:10px 12px;margin:8px 0;font-size:14px;background:var(--pick-bg)}
