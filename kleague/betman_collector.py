@@ -130,6 +130,26 @@ def candidate_rounds(last, check_prev=False):
     return cands
 
 
+MAX_OPEN_ROUNDS = 5  # 아직 안 끝난 회차는 최근 회차 기준 5회차 전까지만 다시 본다
+
+
+def open_rounds(open_from, last):
+    """최근 회차보다 앞이지만 아직 발매 중이거나 결과 전인 회차들.
+
+    베트맨은 앞으로의 회차를 미리 올리므로 '가장 최근 회차'만 보면 지금 발매 중인 회차를 놓친다.
+    발매 전에 배당 없이 받았던 경기도 발매 뒤 배당이 생기면 이렇게 다시 봐야 저장된다.
+    """
+    year, no = divmod(last, 10000)
+    start = open_from if open_from and open_from // 10000 == year else last - 3
+    start = max(start, last - MAX_OPEN_ROUNDS, year * 10000 + 1)
+    return list(range(start, last))
+
+
+def is_open(rows):
+    """결과가 확정되지 않은 행(발매 전 발매 중 마감 후 결과 전)이 하나라도 있으면 True"""
+    return any(str(r.get("protoStatus")) not in ("4", "20") for r in rows)
+
+
 def pause_hours(fail_count):
     return min(PAUSE_BASE_HOURS * 2 ** (fail_count - 1), 24)
 
@@ -294,9 +314,12 @@ def main(argv=None):
         time.sleep(random.uniform(0, MAX_JITTER_SEC))
 
     check_prev = now - state.get("prev_checked_at", 0) >= PREV_CHECK_SEC
-    rounds = [args.gmts] if args.gmts else candidate_rounds(state.get("last_gmts", 260113), check_prev)
+    last = state.get("last_gmts", 260113)
+    rounds = [args.gmts] if args.gmts else sorted(set(open_rounds(state.get("open_from"), last)
+                                                     + candidate_rounds(last, check_prev)))
 
     newest, ok, failed = state.get("last_gmts", 0), 0, 0
+    still_open = []
     for i, gm_ts in enumerate(rounds):
         if i:
             time.sleep(random.uniform(2, 6))  # 요청 사이 간격도 사람처럼
@@ -306,10 +329,13 @@ def main(argv=None):
         except Exception as e:  # 네트워크 오류나 JSON 이 아닌 응답
             print(f"{gm_ts}: 조회 실패 ({e})")
             failed += 1
+            still_open.append(gm_ts)  # 못 봤으니 다음에 다시 본다
             continue
         if not rows:
             continue
         newest = max(newest, gm_ts)
+        if is_open(rows):
+            still_open.append(gm_ts)
         picked = filter_rows(rows, args.league)
         print(f"{gm_ts}: 전체 {len(rows)}행 중 대상 {len(picked)}행")
         if not picked:
@@ -330,6 +356,8 @@ def main(argv=None):
     if ok:
         notify(url, token)
     state["last_gmts"] = newest or state.get("last_gmts", 260113)
+    # 다음 실행은 아직 안 끝난 가장 오래된 회차부터 본다
+    state["open_from"] = min(still_open) if still_open else state["last_gmts"]
     if check_prev and ok:
         state["prev_checked_at"] = now
     if failed and not ok:

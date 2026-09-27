@@ -68,6 +68,31 @@ class BetmanTest(unittest.TestCase):
             dt.datetime.now.return_value.year = 2027
             self.assertEqual(bc.candidate_rounds(260150), [260150, 260151, 270001, 270002])
 
+    def test_open_rounds_keeps_selling_rounds(self):
+        # 최근 회차가 260116 이어도 발매 중인 260114 를 계속 본다
+        self.assertEqual(bc.open_rounds(260114, 260116), [260114, 260115])
+        self.assertEqual(bc.open_rounds(None, 260116), [260113, 260114, 260115])   # 처음엔 3회차 전부터
+        self.assertEqual(bc.open_rounds(260100, 260116), [260111, 260112, 260113, 260114, 260115])  # 최대 5회차
+        self.assertEqual(bc.open_rounds(250150, 260002), [260001])  # 해가 바뀌면 올해 1회차부터
+        self.assertTrue(bc.is_open([{"protoStatus": "4"}, {"protoStatus": None}]))
+        self.assertFalse(bc.is_open([{"protoStatus": "4"}, {"protoStatus": "20"}]))
+
+    def test_auto_run_revisits_open_round_and_records_it(self):
+        open_row = {"protoStatus": "2", "matchSeq": 1}
+        done_row = {"protoStatus": "4", "matchSeq": 1}
+        data = {260113: done_row, 260114: open_row, 260115: open_row, 260116: open_row}
+        seen = []
+
+        def fetch(ts):
+            seen.append(ts)
+            row = data.get(ts)
+            return {"compSchedules": {"keys": list(row), "datas": [list(row.values())]}} if row else {}
+        with mock.patch.object(bc, "notify"):
+            saved = self._run_auto(fetch, {"last_gmts": 260116, "open_from": 260113, "prev_checked_at": 9e18})
+        self.assertEqual(seen, [260113, 260114, 260115, 260116, 260117])
+        self.assertEqual(saved["open_from"], 260114)  # 260113 은 결과가 다 나와서 빠진다
+        self.assertEqual(saved["last_gmts"], 260116)
+
     def test_pause_hours_grows_and_caps(self):
         self.assertEqual([bc.pause_hours(n) for n in (1, 2, 3, 5, 9)], [2, 4, 8, 24, 24])
 
